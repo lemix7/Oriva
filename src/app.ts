@@ -1,0 +1,73 @@
+import dotenv from "dotenv";
+import express, {
+  type Response,
+  type Request,
+  type Express,
+  response,
+} from "express";
+import projectRouter from "./routes/project.routes.ts";
+import taskRouter from "./routes/task.routes.ts";
+import userRouter from "./routes/users.routes.ts";
+import errorHandling from "./middleware/error-handling.ts";
+import looger from "./middleware/logger.ts";
+import { login, authenticateJWT } from "./auth/auth-jwt.ts";
+import { createUser } from "./contollers/users.controller.ts";
+import {
+  createUserValidator,
+  loginUserValidator,
+} from "./validators/users.validator.ts";
+import validate from "./middleware/validate.ts";
+import messageProvider from "./validators/message-provider.ts";
+import parseProfile from "./middleware/parse-profile.ts";
+
+dotenv.config();
+
+const app: Express = express();
+const port = process.env.PORT || 4000;
+
+app.use(express.json());
+app.use(looger);
+
+// Public endpoints no token required
+app.get("/", (req: Request, res: Response) => {
+  res.status(200).json("Hello world");
+});
+app.use("/login", validate(loginUserValidator, messageProvider), login);
+app.post(
+  "/users",
+  parseProfile.single("profilePic"),
+  validate(createUserValidator, messageProvider),
+  createUser,
+);
+
+// app.post("/upload", upload.single("file"), (req, res) => {
+//   if (!req.file) {
+//     res.status(400).json({ message: "Please upload a file" });
+//     return;
+//   }
+
+//   const file = req.file as Express.MulterS3.File;
+
+//   res.status(201).json({
+//     message: "File uploaded successfully",
+//     key: file.key,
+//     fileUrl: file.location,
+//   });
+// });
+
+app.get("/error", (req: Request, res: Response) => {
+  throw new Error("testing the error middleware");
+});
+
+app.use(authenticateJWT);
+
+// Protected endpoints
+app.use("/users/projects", projectRouter);
+app.use("/projects", taskRouter);
+app.use("/users", userRouter);
+
+app.use(errorHandling);
+
+app.listen(port, () => {
+  console.log("The app is running on port 4000");
+});

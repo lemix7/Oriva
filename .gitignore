@@ -1,0 +1,22 @@
+# Dependencies and compiled output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Redis persistence
+dump.rdb
+appendonly.aof
+appendonlydir/
+
+# Logs and test output
+*.log
+coverage/
+.playwright-mcp/
+
+# macOS
+.DS_Store

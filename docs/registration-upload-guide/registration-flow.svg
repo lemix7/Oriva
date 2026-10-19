@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1450" height="1060" viewBox="0 0 1450 1060" role="img" aria-label="Parse first. Validate next. Upload after approval.">
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#52667b"/></marker></defs>
+<rect width="1450" height="1060" fill="#ffffff"/>
+<text x="40" y="62.0" font-family="Arial,sans-serif" font-size="32" fill="#25364a">Parse first. Validate next. Upload after approval.</text>
+<text x="40" y="101.0" font-family="Arial,sans-serif" font-size="19" fill="#52667b">How the registration request changed as we separated reading a file from storing it.</text>
+<text x="40" y="166.0" font-family="Arial,sans-serif" font-size="21" fill="#25364a">The original failure</text>
+<rect x="40" y="190" width="310" height="165" rx="12" fill="#e7f5ff" stroke="#25364a" stroke-width="1.5"/>
+<text x="56" y="229.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Postman</text>
+<text x="56" y="268.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Text fields + picture</text>
+<text x="56" y="292.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">multipart/form-data</text>
+<path d="M355 270 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="390" y="190" width="310" height="165" rx="12" fill="#f1f3f5" stroke="#25364a" stroke-width="1.5"/>
+<text x="406" y="229.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">express.json()</text>
+<text x="406" y="268.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Skips multipart requests</text>
+<text x="406" y="292.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Text is not parsed</text>
+<path d="M705 270 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="740" y="190" width="310" height="165" rx="12" fill="#ffe3e3" stroke="#25364a" stroke-width="1.5"/>
+<text x="756" y="229.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">VineJS</text>
+<text x="756" y="268.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Reads req.body too early</text>
+<text x="756" y="292.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Validation fails</text>
+<path d="M1055 270 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1090" y="190" width="310" height="165" rx="12" fill="#f1f3f5" stroke="#25364a" stroke-width="1.5"/>
+<text x="1106" y="229.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Multer / S3</text>
+<text x="1106" y="268.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Would parse and upload</text>
+<text x="1106" y="292.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Never reached here</text>
+<text x="40" y="393.0" font-family="Arial,sans-serif" font-size="18" fill="#52667b">The parser must run before validation can inspect the fields.</text>
+<text x="40" y="466.0" font-family="Arial,sans-serif" font-size="21" fill="#25364a">Why moving multer-s3 earlier was incomplete</text>
+<rect x="40" y="490" width="310" height="165" rx="12" fill="#e7f5ff" stroke="#25364a" stroke-width="1.5"/>
+<text x="56" y="529.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Multer / S3</text>
+<text x="56" y="568.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Reads the form</text>
+<text x="56" y="592.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Uploads immediately</text>
+<path d="M355 570 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="390" y="490" width="310" height="165" rx="12" fill="#ffe3e3" stroke="#25364a" stroke-width="1.5"/>
+<text x="406" y="529.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">VineJS</text>
+<text x="406" y="568.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Invalid email or password</text>
+<text x="406" y="592.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Rejects registration</text>
+<path d="M705 570 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="740" y="490" width="310" height="165" rx="12" fill="#f1f3f5" stroke="#25364a" stroke-width="1.5"/>
+<text x="756" y="529.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Database</text>
+<text x="756" y="568.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">User insert is skipped</text>
+<text x="756" y="592.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">No user is created</text>
+<path d="M1055 570 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1090" y="490" width="310" height="165" rx="12" fill="#fff3bf" stroke="#25364a" stroke-width="1.5"/>
+<text x="1106" y="529.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">S3 object remains</text>
+<text x="1106" y="568.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Requires cleanup</text>
+<text x="1106" y="592.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">An orphaned image</text>
+<text x="40" y="693.0" font-family="Arial,sans-serif" font-size="18" fill="#52667b">Correct parsing order alone does not prevent uploads for invalid registrations.</text>
+<text x="40" y="766.0" font-family="Arial,sans-serif" font-size="21" fill="#25364a">The chosen approach</text>
+<rect x="40" y="790" width="310" height="165" rx="12" fill="#e7f5ff" stroke="#25364a" stroke-width="1.5"/>
+<text x="56" y="829.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Multer memoryStorage</text>
+<text x="56" y="868.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">req.body = text fields</text>
+<text x="56" y="892.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">req.file.buffer = file bytes</text>
+<text x="56" y="916.6" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Up to 5 MB per file</text>
+<path d="M355 870 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="390" y="790" width="310" height="165" rx="12" fill="#e7f5ff" stroke="#25364a" stroke-width="1.5"/>
+<text x="406" y="829.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">VineJS</text>
+<text x="406" y="868.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Validate user fields</text>
+<text x="406" y="892.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Reject before uploading</text>
+<path d="M705 870 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="740" y="790" width="310" height="165" rx="12" fill="#d3f9d8" stroke="#25364a" stroke-width="1.5"/>
+<text x="756" y="829.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">Controller / S3</text>
+<text x="756" y="868.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Hash password</text>
+<text x="756" y="892.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Choose unique object key</text>
+<text x="756" y="916.6" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Upload buffer to S3</text>
+<path d="M1055 870 l30 0" stroke="#52667b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="1090" y="790" width="310" height="165" rx="12" fill="#d3f9d8" stroke="#25364a" stroke-width="1.5"/>
+<text x="1106" y="829.0" font-family="Arial,sans-serif" font-size="22" fill="#25364a">PostgreSQL</text>
+<text x="1106" y="868.0" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Insert user details</text>
+<text x="1106" y="892.3" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Store the same S3 key</text>
+<text x="1106" y="916.6" font-family="Arial,sans-serif" font-size="18" fill="#25364a">Return success</text>
+<text x="40" y="993.0" font-family="Arial,sans-serif" font-size="18" fill="#52667b">If the database insert fails after upload, attempt to delete the S3 object. The picture is optional.</text>
+</svg>
