@@ -40,20 +40,6 @@ app.post(
   createUser,
 );
 
-// app.post("/upload", upload.single("file"), (req, res) => {
-//   if (!req.file) {
-//     res.status(400).json({ message: "Please upload a file" });
-//     return;
-//   }
-
-//   const file = req.file as Express.MulterS3.File;
-
-//   res.status(201).json({
-//     message: "File uploaded successfully",
-//     key: file.key,
-//     fileUrl: file.location,
-//   });
-// });
 
 app.get("/error", (req: Request, res: Response) => {
   throw new Error("testing the error middleware");

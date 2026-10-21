@@ -1,5 +1,6 @@
 import express, { type Request, type Response, type Express } from "express";
 import * as taskRepository from "../repositories/task.repository.ts";
+import { getCachedTasks } from "../services/task-cache.service.ts";
 
 const get_tasks = async (req: Request, res: Response) => {
   if (!req.user || typeof req.user === "string") {
@@ -7,7 +8,8 @@ const get_tasks = async (req: Request, res: Response) => {
   }
   const userId = req.user.userId;
   const projectId = req.params.project_id;
-  const tasks = await taskRepository.findTasksForUser(userId, projectId);
+
+  const tasks = await getCachedTasks(userId, projectId);
 
   if (tasks.length == 0) {
     return res.status(200).send([]);
@@ -41,7 +43,12 @@ const create_task = async (req: Request, res: Response) => {
     });
   }
 
-  const tasks = await taskRepository.insertTask(title, description, status, projectId);
+  const tasks = await taskRepository.insertTask(
+    title,
+    description,
+    status,
+    projectId,
+  );
   res.status(200).json(tasks);
 };
 
@@ -53,7 +60,12 @@ const update_task = async (req: Request, res: Response) => {
   const userId = req.user.userId;
   const taskId = req.params.task_id;
   const update = "done";
-  const updated = await taskRepository.updateTaskForUser(update, taskId, userId, projectId);
+  const updated = await taskRepository.updateTaskForUser(
+    update,
+    taskId,
+    userId,
+    projectId,
+  );
 
   if (!updated) {
     return res.status(404).json({ message: "Task not found" });
