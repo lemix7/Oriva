@@ -12,12 +12,20 @@ import {
 dotenv.config();
 
 const getUsers = async (req: Request, res: Response) => {
-  const users = await userRepository.findAllUsers();
-  res.status(200).json(users);
+  if (!req.user || typeof req.user === "string") {
+    return res.status(401).send("Unauthorized");
+  }
+  return res.status(403).json({ message: "Listing users is forbidden" });
 };
 
 const getUserById = async (req: Request, res: Response) => {
+  if (!req.user || typeof req.user === "string") {
+    return res.status(401).send("Unauthorized");
+  }
   const id = Number(req.params.user_id);
+  if (id !== req.user.userId) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
   const users = await userRepository.findUsersById(id);
   res.status(200).json(users);
 };
@@ -60,7 +68,13 @@ const createUser = async (req: Request, res: Response) => {
 };
 
 const updateUser = async (req: Request, res: Response) => {
+  if (!req.user || typeof req.user === "string") {
+    return res.status(401).send("Unauthorized");
+  }
   const id = Number(req.params.user_id);
+  if (id !== req.user.userId) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
   const { name, email } = req.body;
   const updated = await userRepository.updateUser(name, email, id);
   if (!updated) {
@@ -70,7 +84,13 @@ const updateUser = async (req: Request, res: Response) => {
 };
 
 const deleteUser = async (req: Request, res: Response) => {
+  if (!req.user || typeof req.user === "string") {
+    return res.status(401).send("Unauthorized");
+  }
   const id = Number(req.params.user_id);
+  if (id !== req.user.userId) {
+    return res.status(403).json({ message: "Forbidden" });
+  }
   await userRepository.deleteUser(id);
   res.status(200).send(`User deleted with ID: ${id}`);
 };
