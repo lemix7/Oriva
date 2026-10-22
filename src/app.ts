@@ -23,7 +23,6 @@ import parseProfile from "./middleware/parse-profile.ts";
 dotenv.config();
 
 const app: Express = express();
-const port = process.env.PORT || 4000;
 
 app.use(express.json());
 app.use(looger);
@@ -54,6 +53,4 @@ app.use("/users", userRouter);
 
 app.use(errorHandling);
 
-app.listen(port, () => {
-  console.log("The app is running on port 4000");
-});
+export default app;

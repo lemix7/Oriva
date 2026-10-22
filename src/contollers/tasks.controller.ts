@@ -43,13 +43,13 @@ const create_task = async (req: Request, res: Response) => {
     });
   }
 
-  const tasks = await taskRepository.insertTask(
+  await taskRepository.insertTask(
     title,
     description,
     status,
     projectId,
   );
-  res.status(200).json(tasks);
+  res.status(201).json({ message: "Task is successfully created" });
 };
 
 const update_task = async (req: Request, res: Response) => {
@@ -81,7 +81,10 @@ const delete_task = async (req: Request, res: Response) => {
   const userId = req.user.userId;
   const projectId = req.params.project_id;
   const taskId = req.params.task_id;
-  await taskRepository.deleteTaskForUser(userId, projectId, taskId);
+  const deleted = await taskRepository.deleteTaskForUser(userId, projectId, taskId);
+  if (!deleted) {
+    return res.status(404).json({ message: "Task not found" });
+  }
   res.status(200).json("task is deleted");
 };
 

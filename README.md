@@ -93,7 +93,7 @@ npm start
 
 The default base URL is `http://localhost:4000`.
 
-The email worker currently starts inside the API process when the user controller is imported. No separate worker command is needed.
+The email worker starts inside the API process from `src/index.ts`. No separate worker command is needed. `src/app.ts` exports the Express app for HTTP tests.
 
 ## API endpoints
 
@@ -202,7 +202,8 @@ src/
 ├── typess/        # Express request type extensions
 ├── validators/    # VineJS schemas
 ├── workers/       # Email queue processor
-└── app.ts         # Application startup
+├── app.ts         # Express app configuration and export
+└── index.ts       # HTTP server and email worker startup
 ```
 
 Controllers handle HTTP requests and responses. Repositories contain SQL. The profile storage adapter translates upload and deletion operations into AWS SDK commands.
@@ -221,6 +222,16 @@ Check TypeScript without generating build output:
 npx tsc --noEmit
 ```
 
-`npm test` is currently a placeholder and exits with an error. The repository does not yet provide a configured automated test command.
+Tests compile TypeScript before running Jest:
+
+```bash
+npm test                  # Unit tests; no external services required
+npm run test:integration   # Repository tests against real PostgreSQL
+npm run test:e2e           # Real HTTP login and project ownership flow
+```
+
+Database-backed tests require `.env.test` with `TEST_DATABASE_URL` pointing to the local `oriva_test` database and the application schema installed. This local file is ignored by Git. Tests refuse other database names and non-local hosts, create their own fixtures, and delete those fixtures afterward.
+
+The HTTP suite starts the app on an available loopback port and uses real password checks, JWTs, routes, controllers, and PostgreSQL. Email queuing, cloud uploads, and Redis are mocked; they are not covered by this flow. The HTTP server and database pool are closed when testing finishes.
 
 The public `GET /error` route intentionally throws an error to exercise error handling. Remove or restrict it before deployment.

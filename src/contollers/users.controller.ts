@@ -3,7 +3,6 @@ import * as userRepository from "../repositories/user.repository.ts";
 import bcrypt from "bcryptjs";
 import dotenv from "dotenv";
 import emailQueue from "../queue/email.que.ts";
-import "../workers/email.worker.ts";
 import {
   uploadProfilePicture,
   deleteProfilePicture,
