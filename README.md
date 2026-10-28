@@ -235,3 +235,38 @@ Database-backed tests require `.env.test` with `TEST_DATABASE_URL` pointing to t
 The HTTP suite starts the app on an available loopback port and uses real password checks, JWTs, routes, controllers, and PostgreSQL. Email queuing, cloud uploads, and Redis are mocked; they are not covered by this flow. The HTTP server and database pool are closed when testing finishes.
 
 The public `GET /error` route intentionally throws an error to exercise error handling. Remove or restrict it before deployment.
+
+## Lakebase Postgres via Neon
+
+Neon connection strings are stored in the git-ignored `.env.neon` file.
+Keep the SSL parameters supplied by Neon. Do not commit or print connection strings.
+
+`schema.sql` is a schema-only snapshot of the current local application database,
+including tables, sequences, constraints, indexes, and cache functions/triggers.
+It includes the changes from migrations 001–003; do not replay those on top of
+this baseline. The snapshot was imported into Neon without existing user,
+project, or task rows. It does not include the future workspace blueprint.
+Express uses Neon's pooled connection through `DATABASE_URL` in `.env`.
+Docker uses the same Neon connection through `DOCKER_DATABASE_URL`.
+Previous local URLs are preserved as `LOCAL_DATABASE_URL` and
+`LOCAL_DOCKER_DATABASE_URL`; integration and HTTP tests retain their separate
+local test database. The Docker app requires Redis but no longer waits for
+local PostgreSQL. Restart a running API process or recreate the app container
+to load the new connection settings.
+
+The Neon CLI was installed under the existing Node 22 installation. If your
+shell cannot find it, first run `nvm use 22.23.2`.
+
+## Drizzle repositories
+
+Project, task, and user repositories use the shared Drizzle client in
+`src/db/index.ts`, backed by the existing `pg` pool. Explicit projections retain
+the API's snake_case fields, and cache versions are serialized as strings.
+Task updates and deletes include the ownership check in the same SQL statement.
+Task reads retain the previous flat join response, including project values
+for column names shared by projects and tasks.
+
+The schema's custom date mappings reuse `pg` parsers so existing timestamps
+and date values keep their previous JavaScript types and timezone behavior.
+The database schema and cache triggers are unchanged. Login uses the Drizzle-backed
+`findUserByEmail` repository function; password checks and JWT behavior are unchanged.

@@ -1,4 +1,5 @@
 import { beforeEach, expect, jest, test } from "@jest/globals";
+import { joinedTaskFixture } from "./fixtures.ts";
 
 type Repository = typeof import("../repositories/task.repository.ts");
 const findTaskCacheVersion = jest.fn<Repository["findTaskCacheVersion"]>();
@@ -49,7 +50,7 @@ test("cached reads use a separate key for each authenticated owner", async () =>
 });
 
 test("a cache miss queries tasks for the authenticated owner and project", async () => {
-  const tasks = [{ id: 10 }];
+  const tasks = [joinedTaskFixture()];
   findTaskCacheVersion.mockResolvedValue("3");
   get.mockResolvedValue(null);
   findTasksForUser.mockResolvedValue(tasks);

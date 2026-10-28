@@ -6,7 +6,9 @@ const verify = jest.fn<
   (token: string, secret: string, callback: VerifyCallback) => void
 >();
 
-const query = jest.fn<(...args: unknown[]) => Promise<{ rows: unknown[] }>>();
+const findUserByEmail = jest.fn<
+  typeof import("../repositories/user.repository.ts").findUserByEmail
+>();
 const compare = jest.fn<(password: string, hash: string) => Promise<boolean>>();
 const sign = jest.fn<(...args: unknown[]) => string>();
 
@@ -14,8 +16,8 @@ const sign = jest.fn<(...args: unknown[]) => string>();
 jest.unstable_mockModule("jsonwebtoken", () => ({
   default: { verify, sign },
 }));
-jest.unstable_mockModule("../pool/pooler.js", () => ({
-  default: { query },
+jest.unstable_mockModule("../repositories/user.repository.js", () => ({
+  findUserByEmail,
 }));
 jest.unstable_mockModule("dotenv", () => ({
   default: { config: jest.fn() },
@@ -35,7 +37,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   verify.mockReset();
-  query.mockReset();
+  findUserByEmail.mockReset();
   compare.mockReset();
   sign.mockReset();
 });
@@ -177,10 +179,10 @@ test("rejects an expired token without continuing", async () => {
 });
 
 test("login rejects an unknown email without comparing passwords or signing", async () => {
-  query.mockResolvedValue({ rows: [] });
+  findUserByEmail.mockResolvedValue(null);
   const res = loginResponse();
   await login(loginRequest(), res as unknown as Response);
-  expect(query).toHaveBeenCalledWith(expect.any(String), ["learner@example.com"]);
+  expect(findUserByEmail).toHaveBeenCalledWith("learner@example.com");
   expect(res.status).toHaveBeenCalledWith(401);
   expect(res.send).toHaveBeenCalledWith("Invalid credentials");
   expect(compare).not.toHaveBeenCalled();
@@ -188,7 +190,7 @@ test("login rejects an unknown email without comparing passwords or signing", as
 });
 
 test("login rejects a wrong password without issuing a token", async () => {
-  query.mockResolvedValue({ rows: [{ id: 42, password: "stored-hash" }] });
+  findUserByEmail.mockResolvedValue({ id: 42, password: "stored-hash" });
   compare.mockResolvedValue(false);
   const res = loginResponse();
   await login(loginRequest(), res as unknown as Response);
@@ -199,7 +201,7 @@ test("login rejects a wrong password without issuing a token", async () => {
 });
 
 test("login signs a one-hour token for the database user after password verification", async () => {
-  query.mockResolvedValue({ rows: [{ id: 42, password: "stored-hash" }] });
+  findUserByEmail.mockResolvedValue({ id: 42, password: "stored-hash" });
   compare.mockResolvedValue(true);
   sign.mockReturnValue("signed-token");
   const req = loginRequest();
@@ -217,7 +219,7 @@ test("login signs a one-hour token for the database user after password verifica
 
 test("login propagates database failures without issuing a token or success response", async () => {
   const error = new Error("database unavailable");
-  query.mockRejectedValue(error);
+  findUserByEmail.mockRejectedValue(error);
   const res = loginResponse();
   await expect(login(loginRequest(), res as unknown as Response)).rejects.toBe(error);
   expect(compare).not.toHaveBeenCalled();
@@ -226,7 +228,7 @@ test("login propagates database failures without issuing a token or success resp
 });
 
 test("login propagates signing failures without sending success", async () => {
-  query.mockResolvedValue({ rows: [{ id: 42, password: "stored-hash" }] });
+  findUserByEmail.mockResolvedValue({ id: 42, password: "stored-hash" });
   compare.mockResolvedValue(true);
   const error = new Error("signing failed");
   sign.mockImplementation(() => { throw error; });

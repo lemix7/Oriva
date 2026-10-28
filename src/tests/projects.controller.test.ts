@@ -1,5 +1,6 @@
 import { beforeEach, expect, jest, test } from "@jest/globals";
 import type { Request, Response } from "express";
+import { projectFixture } from "./fixtures.ts";
 
 type Repository = typeof import("../repositories/project.repository.ts");
 const getAllProject = jest.fn<Repository["getAllProject"]>();
@@ -58,7 +59,7 @@ for (const handler of [get_project_by_ID, update_project, delete_project]) {
 }
 
 test("lists projects using the authenticated owner", async () => {
-  const projects = [{ id: 7, user_id: 42 }];
+  const projects = [projectFixture()];
   getAllProject.mockResolvedValue(projects);
   const res = response();
   await get_projects(request(), res as unknown as Response);
@@ -67,7 +68,7 @@ test("lists projects using the authenticated owner", async () => {
   expect(res.json).toHaveBeenCalledWith(projects);
 });
 
-test.each([null, { id: 7, user_id: 42 }])("reads a project through the ownership-filtered lookup: %j", async (project) => {
+test.each([null, projectFixture()])("reads a project through the ownership-filtered lookup: %j", async (project) => {
   getProjectsByUserId.mockResolvedValue(project);
   const res = response();
   await get_project_by_ID(request(), res as unknown as Response);
@@ -77,7 +78,7 @@ test.each([null, { id: 7, user_id: 42 }])("reads a project through the ownership
 });
 
 test("creates a project for the authenticated owner using validated data", async () => {
-  const project = { id: 7, user_id: 42 };
+  const project = projectFixture();
   createProject.mockResolvedValue(project);
   const res = response();
   await create_project(request(), res as unknown as Response);
@@ -86,7 +87,7 @@ test("creates a project for the authenticated owner using validated data", async
   expect(res.json).toHaveBeenCalledWith(project);
 });
 
-test.each([null, { id: 7, user_id: 42 }])("updates a project through the ownership-filtered repository: %j", async (project) => {
+test.each([null, projectFixture()])("updates a project through the ownership-filtered repository: %j", async (project) => {
   updateProject.mockResolvedValue(project);
   const res = response();
   await update_project(request(), res as unknown as Response);
@@ -95,7 +96,7 @@ test.each([null, { id: 7, user_id: 42 }])("updates a project through the ownersh
   expect(res.json).toHaveBeenCalledWith(project ? "project status updated" : { message: "Project not found" });
 });
 
-test.each([null, { id: 7, user_id: 42 }])("deletes a project through the ownership-filtered repository: %j", async (project) => {
+test.each([null, projectFixture()])("deletes a project through the ownership-filtered repository: %j", async (project) => {
   deleteProject.mockResolvedValue(project);
   const res = response();
   await delete_project(request(), res as unknown as Response);
