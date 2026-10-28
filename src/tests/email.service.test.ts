@@ -1,4 +1,4 @@
-import { beforeEach, expect, jest, test } from "@jest/globals";
+import { afterAll, beforeEach, expect, jest, test } from "@jest/globals";
 import { UnrecoverableError } from "bullmq";
 
 const send = jest.fn<(...args: unknown[]) => Promise<unknown>>();
@@ -13,7 +13,14 @@ jest.unstable_mockModule("dotenv", () => ({
   default: { config: jest.fn() },
 }));
 
+const originalApiKey = process.env.RESEND_API_KEY;
+process.env.RESEND_API_KEY = "unit-test-resend-key";
 const { default: newUserEmail } = await import("../services/email.service.ts");
+
+afterAll(() => {
+  if (originalApiKey === undefined) delete process.env.RESEND_API_KEY;
+  else process.env.RESEND_API_KEY = originalApiKey;
+});
 
 beforeEach(() => {
   send.mockReset();
@@ -33,6 +40,20 @@ test("invalid credentials cause an unrecoverable failure", async () => {
     .rejects.toBeInstanceOf(UnrecoverableError);
 
   expect(send).toHaveBeenCalledTimes(1);
+});
+
+test("email service cannot initialize without its API key", async () => {
+  const key = process.env.RESEND_API_KEY;
+  try {
+    delete process.env.RESEND_API_KEY;
+    jest.resetModules();
+    await expect(import("../services/email.service.ts"))
+      .rejects.toThrow("Missing required environment variable: RESEND_API_KEY");
+    expect(send).not.toHaveBeenCalled();
+  } finally {
+    if (key === undefined) delete process.env.RESEND_API_KEY;
+    else process.env.RESEND_API_KEY = key;
+  }
 });
 
 test.each([

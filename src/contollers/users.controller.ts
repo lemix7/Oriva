@@ -1,14 +1,11 @@
 import express, { type Response, type Request, type Express } from "express";
 import * as userRepository from "../repositories/user.repository.ts";
 import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
 import emailQueue from "../queue/email.que.ts";
 import {
   uploadProfilePicture,
   deleteProfilePicture,
 } from "../adapters/profile-pic-storage.adapter.ts";
-
-dotenv.config();
 
 const getUsers = async (req: Request, res: Response) => {
   if (!req.user || typeof req.user === "string") {

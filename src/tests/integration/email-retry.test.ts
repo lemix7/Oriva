@@ -7,6 +7,7 @@ import { join } from "node:path";
 import type { Queue, QueueEvents, Worker } from "bullmq";
 
 const send = jest.fn<(...args: unknown[]) => Promise<unknown>>();
+const originalApiKey = process.env.RESEND_API_KEY;
 let directory: string | undefined;
 let redisProcess: ChildProcess | undefined;
 let queue: Queue | undefined;
@@ -21,6 +22,7 @@ jest.unstable_mockModule("resend", () => ({
 jest.unstable_mockModule("dotenv", () => ({ default: { config: jest.fn() } }));
 
 beforeAll(async () => {
+  process.env.RESEND_API_KEY = "integration-test-resend-key";
   // A fresh socket-only Redis process ensures tests cannot reach application
   // queues or send real email. It never listens on a network port or saves data.
   directory = await mkdtemp(join(tmpdir(), "oriva-email-"));
@@ -66,6 +68,8 @@ afterAll(async () => {
   try {
     await Promise.all([worker?.close(), events?.close(), queue?.close()]);
   } finally {
+    if (originalApiKey === undefined) delete process.env.RESEND_API_KEY;
+    else process.env.RESEND_API_KEY = originalApiKey;
     logs?.mockRestore();
     errors?.mockRestore();
     if (redisProcess && redisProcess.exitCode === null && redisProcess.signalCode === null) {

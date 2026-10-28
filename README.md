@@ -232,6 +232,14 @@ unlimited guarantee against duplicate delivery.
 
 ## Verification and development notes
 
+`src/config/env.ts` loads environment settings once and provides `requiredEnv`.
+Database access requires `DATABASE_URL`; authentication requires `SECRET_KEY`;
+the email worker requires `RESEND_API_KEY`; profile storage requires
+`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_BUCKET_NAME`.
+Each component checks its settings when initialized. Missing or whitespace-only
+values produce an error naming the setting without printing its value. Existing
+defaults for `PORT`, `REDIS_HOST`, and `REDIS_PORT` remain available.
+
 Check TypeScript without generating build output:
 
 ```bash
@@ -294,3 +302,19 @@ The schema's custom date mappings reuse `pg` parsers so existing timestamps
 and date values keep their previous JavaScript types and timezone behavior.
 The database schema and cache triggers are unchanged. Login uses the Drizzle-backed
 `findUserByEmail` repository function; password checks and JWT behavior are unchanged.
+
+## Request tracing
+
+Login requests are limited to 10 per IP address per 15 minutes, before login
+validation and password checking. Further requests return 429 with a request ID
+and `Retry-After` header. Counts use process memory: restarting the API resets
+them, and multiple API processes do not share counts.
+
+Every request receives a server-generated `X-Request-ID`. The request logger
+records that ID, timestamp, method, full path without the query string, response
+status, and duration as JSON after the response finishes. It does not log request
+bodies or headers.
+
+The central error handler includes `requestId` in malformed JSON (400), validation
+(422), and unexpected error (500) responses. Unexpected errors produce a matching
+JSON error log without exposing the error message to clients or logs.

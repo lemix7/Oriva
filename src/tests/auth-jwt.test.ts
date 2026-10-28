@@ -238,21 +238,15 @@ test("login propagates signing failures without sending success", async () => {
 });
 
 
-test("authentication fails closed when the signing secret is missing", async () => {
+test("authentication cannot initialize when the signing secret is missing", async () => {
   // Reload only for this case: SECRET_KEY is captured when the module loads.
   const secret = process.env.SECRET_KEY;
   try {
     delete process.env.SECRET_KEY;
     jest.resetModules();
-    const authWithoutSecret = await import("../auth/auth-jwt.ts");
-    const req = { headers: { authorization: "Bearer valid-token" } } as Request;
-    const res = loginResponse();
-    const next = jest.fn();
-    await expect(authWithoutSecret.authenticateJWT(req, res as unknown as Response, next))
-      .rejects.toThrow("SECRET KEY is missing");
+    await expect(import("../auth/auth-jwt.ts"))
+      .rejects.toThrow("Missing required environment variable: SECRET_KEY");
     expect(verify).not.toHaveBeenCalled();
-    expect(next).not.toHaveBeenCalled();
-    expect(res.send).not.toHaveBeenCalled();
   } finally {
     if (secret === undefined) delete process.env.SECRET_KEY;
     else process.env.SECRET_KEY = secret;

@@ -1,14 +1,12 @@
 import jwt from "jsonwebtoken";
 import { type NextFunction, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
+import { requiredEnv } from "../config/env.ts";
 import { loginUserSchema } from "../validators/users.validator.ts";
 import vine, { errors } from "@vinejs/vine";
 import { findUserByEmail } from "../repositories/user.repository.ts";
 
-dotenv.config();
-
-const SECRET_KEY = process.env.SECRET_KEY;
+const SECRET_KEY = requiredEnv("SECRET_KEY");
 
 const login = async (req: Request, res: Response) => {
   const { email, password } = req.body;
@@ -21,10 +19,6 @@ const login = async (req: Request, res: Response) => {
 
     if (!user) {
       return res.status(401).send("Invalid credentials");
-    }
-
-    if (!SECRET_KEY) {
-      throw new Error("SECRET KEY is missing");
     }
 
     const isValid = await bcrypt.compare(password, user.password);
@@ -63,10 +57,6 @@ const authenticateJWT = async (
   const token = authHeader?.startsWith("Bearer")
     ? authHeader.slice(7)
     : undefined;
-
-  if (!SECRET_KEY) {
-    throw new Error("SECRET KEY is missing");
-  }
 
   if (token) {
     jwt.verify(token, SECRET_KEY, (err, user) => {

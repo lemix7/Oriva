@@ -1,10 +1,8 @@
 import { Resend } from "resend";
-import dotenv from "dotenv";
+import { requiredEnv } from "../config/env.ts";
 import { UnrecoverableError } from "bullmq";
 
-dotenv.config();
-
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = new Resend(requiredEnv("RESEND_API_KEY"));
 
 const newUserEmail = async function (
   user_name: string,
