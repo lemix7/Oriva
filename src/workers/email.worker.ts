@@ -11,7 +11,14 @@ const emailWworker = new Worker(
         `Sending email to ahmedgeger@gmail.com about the joing of ${user_name}`,
       );
 
-      const result = await newUserEmail(user_name);
+      if (!job.id) {
+        throw new Error("Email job ID is missing");
+      }
+
+      const result = await newUserEmail(
+        user_name,
+        `registration/${job.queueName}/${job.id}/${job.timestamp}`,
+      );
 
       if (!result) {
         throw new Error("Email delivery failed");

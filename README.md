@@ -206,13 +206,20 @@ src/
 └── index.ts       # HTTP server and email worker startup
 ```
 
-Controllers handle HTTP requests and responses. Repositories contain SQL. The profile storage adapter translates upload and deletion operations into AWS SDK commands.
+Controllers handle HTTP requests and responses. Repositories use Drizzle to build database queries. The profile storage adapter translates upload and deletion operations into AWS SDK commands.
 
 ## Email behavior
 
 Registration notifications currently go to a fixed recipient configured in `src/services/email.service.ts`, rather than to the newly registered user. Update the recipient and sender there for your environment.
 
 If saving a user fails after an upload succeeds, registration attempts to delete the uploaded picture. Once the user is saved, a rejected notification enqueue is logged and registration still succeeds. Failed enqueueing is not persisted for later retry; Redis connection retries can also delay the response.
+
+New email jobs allow three total attempts with exponential backoff (1 second,
+then 2 seconds). The service makes one provider request per attempt. Temporary
+failures remain retryable; permanent provider errors use `UnrecoverableError`
+to stop immediately. The worker reuses a queue/job/timestamp-based idempotency
+key across attempts. Resend retains these keys for 24 hours, so this is not an
+unlimited guarantee against duplicate delivery.
 
 ## Verification and development notes
 
@@ -226,11 +233,19 @@ Tests compile TypeScript before running Jest:
 
 ```bash
 npm test                  # Unit tests; no external services required
-npm run test:integration   # Repository tests against real PostgreSQL
+npm run test:integration   # PostgreSQL repositories and isolated Redis email retries
 npm run test:e2e           # Real HTTP login and project ownership flow
 ```
 
 Database-backed tests require `.env.test` with `TEST_DATABASE_URL` pointing to the local `oriva_test` database and the application schema installed. This local file is ignored by Git. Tests refuse other database names and non-local hosts, create their own fixtures, and delete those fixtures afterward.
+
+Email retry integration tests also require `redis-server` on PATH (or a
+`REDIS_SERVER_BINARY` executable path). They start a temporary Redis process
+with a private Unix socket, no network listener, and no persistence. The actual
+queue, worker, and email service run against it, while Resend is mocked. Tests
+check exhaustion after three attempts, exponential delays, immediate permanent
+failure, successful recovery, and stable idempotency keys. They close all clients,
+stop Redis, and remove their temporary files afterward. No real emails are sent.
 
 The HTTP suite starts the app on an available loopback port and uses real password checks, JWTs, routes, controllers, and PostgreSQL. Email queuing, cloud uploads, and Redis are mocked; they are not covered by this flow. The HTTP server and database pool are closed when testing finishes.
 
