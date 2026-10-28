@@ -303,6 +303,31 @@ and date values keep their previous JavaScript types and timezone behavior.
 The database schema and cache triggers are unchanged. Login uses the Drizzle-backed
 `findUserByEmail` repository function; password checks and JWT behavior are unchanged.
 
+## Local demo seed
+
+After applying both Drizzle migrations to an empty local `oriva_migration_test`
+database, run `npm run db:seed`. The script reads `TEST_DATABASE_URL` from
+`.env.test` (an existing environment value takes priority), reuses its local
+credentials, and always targets `oriva_migration_test`. It refuses remote hosts.
+It does not create the database or run migrations.
+
+The seed creates a Demo Owner (`demo.owner@example.com`, local demo password
+`LocalDemo123!`), one active Demo Project, and two tasks: Plan the project (done)
+and Build the first feature (on progress). The password is stored as a bcrypt
+hash. New projects/tasks use January 1, 2026 as their creation date. IDs remain
+database-generated.
+
+All inserts commit together or roll back on failure. A transaction-scoped lock
+serializes simultaneous seed runs. Reruns reuse demo records by email,
+owner/project name, and project/task title, preserving edits and passwords;
+missing demo records are recreated. Renaming those identifying fields makes
+the original demo record missing, so the next run recreates it. The script
+does not delete records, send email, access Redis/S3, or connect to Neon.
+
+Run `npm run typecheck:seed` to check the scripts and `npm run test:seed` for
+regression coverage. Seed tests require the existing local `oriva_test` schema
+and use connection-private temporary tables and sequences, removed on disconnect.
+
 ## Request tracing
 
 Login requests are limited to 10 per IP address per 15 minutes, before login

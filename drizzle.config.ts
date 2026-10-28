@@ -3,11 +3,14 @@ import { defineConfig } from "drizzle-kit";
 
 dotenv.config({ path: ".env.neon" });
 
-const url = process.env.DATABASE_URL_UNPOOLED;
+const url =
+  process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL_UNPOOLED;
 
-if (!url) {
-  throw new Error("DATABASE_URL_UNPOOLED is missing");
-}
+  if (!url) {
+    throw new Error(
+      "MIGRATION_DATABASE_URL or DATABASE_URL_UNPOOLED is required",
+    );
+  }
 
 export default defineConfig({
   dialect: "postgresql",

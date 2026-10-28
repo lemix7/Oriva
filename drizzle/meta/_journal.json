@@ -8,6 +8,13 @@
       "when": 1793179388944,
       "tag": "0000_clear_centennial",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793186496175,
+      "tag": "0001_cache-invalidation",
+      "breakpoints": true
     }
   ]
 }
