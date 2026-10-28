@@ -93,7 +93,16 @@ npm start
 
 The default base URL is `http://localhost:4000`.
 
-The email worker starts inside the API process from `src/index.ts`. No separate worker command is needed. `src/app.ts` exports the Express app for HTTP tests.
+Run the email worker in a separate terminal with `npm run dev:worker` during
+development, or `npm run worker` after building. `src/index.ts` starts only the
+HTTP API; `src/app.ts` exports the app for HTTP tests. Jobs wait in Redis while
+the worker is stopped.
+
+For Docker, run `docker compose up -d --build app worker`. Compose starts Redis
+as their dependency. Both containers use the same image; the worker overrides
+the startup command and has no HTTP port. Redis is exposed only on loopback
+port 6379 for local development. Keep dollar-containing `.env` values such as
+`SECRET_KEY` single-quoted so Compose preserves them literally.
 
 ## API endpoints
 
@@ -203,7 +212,7 @@ src/
 ├── validators/    # VineJS schemas
 ├── workers/       # Email queue processor
 ├── app.ts         # Express app configuration and export
-└── index.ts       # HTTP server and email worker startup
+└── index.ts       # HTTP server startup
 ```
 
 Controllers handle HTTP requests and responses. Repositories use Drizzle to build database queries. The profile storage adapter translates upload and deletion operations into AWS SDK commands.

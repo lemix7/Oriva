@@ -1,5 +1,4 @@
 import app from "./app.ts";
-import "./workers/email.worker.ts";
 
 const port = process.env.PORT || 4000;
 

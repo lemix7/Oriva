@@ -1,7 +1,7 @@
 services:
   redis:
     image: redis:7.4
-    command: ["redis-server" , "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -9,6 +9,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    ports:
+      - "127.0.0.1:6379:6379"
 
   postgres:
     image: postgres:17
@@ -17,13 +19,16 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
-        - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      test:
+        [
+          "CMD-SHELL",
+          'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"',
+        ]
       interval: 5s
       timeout: 3s
       retries: 10
-
 
   app:
     build: .
@@ -35,6 +40,19 @@ services:
     environment:
       PORT: "4000"
       DATABASE_URL: ${DOCKER_DATABASE_URL:?Set DOCKER_DATABASE_URL in .env}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    image: oriva-api:dev
+    command: ["npm", "run", "worker"]
+    env_file:
+      - .env
+    environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
     depends_on:
