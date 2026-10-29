@@ -1,5 +1,6 @@
-import type { db } from "../db/index.ts";
 import { workspaces, workspaceMembers } from "../db/schema.ts";
+import { db } from "../db/index.ts";
+import { and, asc, eq, gt } from "drizzle-orm";
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -26,4 +27,29 @@ export async function insertOwnerMembership(
     userId,
     role: "owner",
   });
+}
+
+export const WORKSPACE_PAGE_SIZE = 20;
+
+export async function getWorkspacesByUserId(
+  userId: number,
+  afterId = 0,
+) {
+  return db
+    .select({
+      id: workspaces.id,
+      name: workspaces.name,
+      role: workspaceMembers.role,
+    })
+    .from(workspaceMembers)
+    .innerJoin(
+      workspaces,
+      eq(workspaceMembers.workspaceId, workspaces.id),
+    )
+    .where(and(
+      eq(workspaceMembers.userId, userId),
+      gt(workspaces.id, afterId),
+    ))
+    .orderBy(asc(workspaces.id))
+    .limit(WORKSPACE_PAGE_SIZE + 1);
 }
