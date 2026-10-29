@@ -3,13 +3,24 @@ import type { Request, Response } from "express";
 import { joinedTaskFixture, projectFixture, taskFixture } from "./fixtures.ts";
 
 const findOwnedProject =
-  jest.fn<typeof import("../repositories/task.repository.ts").findOwnedProject>();
+  jest.fn<
+    typeof import("../repositories/task.repository.ts").findOwnedProject
+  >();
 const insertTask =
   jest.fn<typeof import("../repositories/task.repository.ts").insertTask>();
 
-const findTaskForUser = jest.fn<typeof import("../repositories/task.repository.ts").findTaskForUser>();
-const updateTaskForUser = jest.fn<typeof import("../repositories/task.repository.ts").updateTaskForUser>();
-const deleteTaskForUser = jest.fn<typeof import("../repositories/task.repository.ts").deleteTaskForUser>();
+const findTaskForUser =
+  jest.fn<
+    typeof import("../repositories/task.repository.ts").findTaskForUser
+  >();
+const updateTaskForUser =
+  jest.fn<
+    typeof import("../repositories/task.repository.ts").updateTaskForUser
+  >();
+const deleteTaskForUser =
+  jest.fn<
+    typeof import("../repositories/task.repository.ts").deleteTaskForUser
+  >();
 const getCachedTasks = jest.fn<(...args: unknown[]) => Promise<unknown[]>>();
 
 // Replace dependencies before importing the controller so no database or
@@ -25,7 +36,8 @@ jest.unstable_mockModule("../services/task-cache.service.js", () => ({
   getCachedTasks,
 }));
 
-const { create_task, get_tasks, get_task_by_Id, update_task, delete_task } = await import("../contollers/tasks.controller.ts");
+const { create_task, get_tasks, get_task_by_Id, update_task, delete_task } =
+  await import("../controllers/tasks.controller.ts");
 
 beforeEach(() => {
   findOwnedProject.mockReset();
@@ -69,9 +81,7 @@ test("rejects task creation when the user does not own the project", async () =>
 test("creates a task in an owned project and returns a 201 success message", async () => {
   // Arrange: ownership is confirmed and the insert succeeds.
   findOwnedProject.mockResolvedValue(projectFixture());
-  insertTask.mockResolvedValue([
-    taskFixture(),
-  ]);
+  insertTask.mockResolvedValue([taskFixture()]);
   const req = {
     user: { userId: 42 },
     params: { project_id: "7" },
@@ -107,43 +117,66 @@ test("creates a task in an owned project and returns a 201 success message", asy
   });
 });
 
-
 function taskRequest(user: Request["user"] = { userId: 42 }) {
   return {
-    user, params: { project_id: "7", task_id: "10" },
+    user,
+    params: { project_id: "7", task_id: "10" },
     body: { title: "Write tests", status: "on progress", userId: 999 },
   } as unknown as Request;
 }
 
 function taskResponse() {
-  return { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis(), send: jest.fn().mockReturnThis() };
+  return {
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn().mockReturnThis(),
+    send: jest.fn().mockReturnThis(),
+  };
 }
 
-const taskHandlers = [get_tasks, get_task_by_Id, create_task, update_task, delete_task];
+const taskHandlers = [
+  get_tasks,
+  get_task_by_Id,
+  create_task,
+  update_task,
+  delete_task,
+];
 for (const handler of taskHandlers) {
-  test.each([null, "untrusted-user"])(`${handler.name} rejects unauthenticated identity %s`, async (user) => {
-    const req = taskRequest();
-    if (user === null) delete req.user;
-    else req.user = user;
-    const res = taskResponse();
-    await handler(req, res as unknown as Response);
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.send).toHaveBeenCalledWith("Unauthorized");
-    for (const dependency of [findOwnedProject, insertTask, findTaskForUser, updateTaskForUser, deleteTaskForUser, getCachedTasks]) {
-      expect(dependency).not.toHaveBeenCalled();
-    }
-  });
+  test.each([null, "untrusted-user"])(
+    `${handler.name} rejects unauthenticated identity %s`,
+    async (user) => {
+      const req = taskRequest();
+      if (user === null) delete req.user;
+      else req.user = user;
+      const res = taskResponse();
+      await handler(req, res as unknown as Response);
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.send).toHaveBeenCalledWith("Unauthorized");
+      for (const dependency of [
+        findOwnedProject,
+        insertTask,
+        findTaskForUser,
+        updateTaskForUser,
+        deleteTaskForUser,
+        getCachedTasks,
+      ]) {
+        expect(dependency).not.toHaveBeenCalled();
+      }
+    },
+  );
 }
 
-test.each([{ tasks: [] }, { tasks: [{ id: 10 }] }])("lists only results returned for the authenticated user's project: $tasks", async ({ tasks }) => {
-  getCachedTasks.mockResolvedValue(tasks);
-  const res = taskResponse();
-  await get_tasks(taskRequest(), res as unknown as Response);
-  expect(getCachedTasks).toHaveBeenCalledWith(42, "7");
-  expect(res.status).toHaveBeenCalledWith(200);
-  if (tasks.length === 0) expect(res.send).toHaveBeenCalledWith([]);
-  else expect(res.json).toHaveBeenCalledWith(tasks);
-});
+test.each([{ tasks: [] }, { tasks: [{ id: 10 }] }])(
+  "lists only results returned for the authenticated user's project: $tasks",
+  async ({ tasks }) => {
+    getCachedTasks.mockResolvedValue(tasks);
+    const res = taskResponse();
+    await get_tasks(taskRequest(), res as unknown as Response);
+    expect(getCachedTasks).toHaveBeenCalledWith(42, "7");
+    expect(res.status).toHaveBeenCalledWith(200);
+    if (tasks.length === 0) expect(res.send).toHaveBeenCalledWith([]);
+    else expect(res.json).toHaveBeenCalledWith(tasks);
+  },
+);
 
 test("single-task lookup passes the authenticated owner, project and task IDs", async () => {
   const tasks = [joinedTaskFixture()];
@@ -155,14 +188,19 @@ test("single-task lookup passes the authenticated owner, project and task IDs", 
   expect(res.json).toHaveBeenCalledWith(tasks);
 });
 
-test.each([false, true])("updating an owned task handles affected-row result %s", async (updated) => {
-  updateTaskForUser.mockResolvedValue(updated);
-  const res = taskResponse();
-  await update_task(taskRequest(), res as unknown as Response);
-  expect(updateTaskForUser).toHaveBeenCalledWith("done", "10", 42, "7");
-  expect(res.status).toHaveBeenCalledWith(updated ? 200 : 404);
-  expect(res.json).toHaveBeenCalledWith(updated ? "task is updated to done" : { message: "Task not found" });
-});
+test.each([false, true])(
+  "updating an owned task handles affected-row result %s",
+  async (updated) => {
+    updateTaskForUser.mockResolvedValue(updated);
+    const res = taskResponse();
+    await update_task(taskRequest(), res as unknown as Response);
+    expect(updateTaskForUser).toHaveBeenCalledWith("done", "10", 42, "7");
+    expect(res.status).toHaveBeenCalledWith(updated ? 200 : 404);
+    expect(res.json).toHaveBeenCalledWith(
+      updated ? "task is updated to done" : { message: "Task not found" },
+    );
+  },
+);
 
 test("deleting a task passes the authenticated owner to the repository", async () => {
   deleteTaskForUser.mockResolvedValue(true);
@@ -191,7 +229,9 @@ test("ownership lookup failure prevents task insertion and a success response", 
   const error = new Error("ownership lookup failed");
   findOwnedProject.mockRejectedValue(error);
   const res = taskResponse();
-  await expect(create_task(taskRequest(), res as unknown as Response)).rejects.toBe(error);
+  await expect(
+    create_task(taskRequest(), res as unknown as Response),
+  ).rejects.toBe(error);
   expect(insertTask).not.toHaveBeenCalled();
   expect(res.json).not.toHaveBeenCalled();
 });
@@ -201,7 +241,9 @@ test("task insertion failure does not send the creation success message", async 
   const error = new Error("insert failed");
   insertTask.mockRejectedValue(error);
   const res = taskResponse();
-  await expect(create_task(taskRequest(), res as unknown as Response)).rejects.toBe(error);
+  await expect(
+    create_task(taskRequest(), res as unknown as Response),
+  ).rejects.toBe(error);
   expect(res.status).not.toHaveBeenCalled();
   expect(res.json).not.toHaveBeenCalled();
 });

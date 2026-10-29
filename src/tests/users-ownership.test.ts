@@ -7,7 +7,12 @@ const findAllUsers = jest.fn<Repository["findAllUsers"]>();
 const findUsersById = jest.fn<Repository["findUsersById"]>();
 const updateUserRecord = jest.fn<Repository["updateUser"]>();
 const deleteUserRecord = jest.fn<Repository["deleteUser"]>();
-const repositoryCalls = [findAllUsers, findUsersById, updateUserRecord, deleteUserRecord];
+const repositoryCalls = [
+  findAllUsers,
+  findUsersById,
+  updateUserRecord,
+  deleteUserRecord,
+];
 
 // Importing the users controller also imports registration dependencies.
 // Replace these before loading it so no worker, database, or cloud client starts.
@@ -28,14 +33,17 @@ jest.unstable_mockModule("../adapters/profile-pic-storage.adapter.js", () => ({
 }));
 jest.unstable_mockModule("dotenv", () => ({ default: { config: jest.fn() } }));
 
-const { getUsers, getUserById, updateUser, deleteUser } =
-  await import("../contollers/users.controller.ts");
+const { getUsers, getUserById, updateUser, deleteUser } = await import(
+  "../controllers/users.controller.ts"
+);
 
 beforeEach(() => {
   for (const mock of repositoryCalls) mock.mockReset();
   // Successful defaults ensure rejection tests cannot pass because of an
   // unrelated database error or a missing record.
-  findAllUsers.mockResolvedValue([userFixture({ id: 99, name: "Another user", email: "another@example.com" })]);
+  findAllUsers.mockResolvedValue([
+    userFixture({ id: 99, name: "Another user", email: "another@example.com" }),
+  ]);
   findUsersById.mockResolvedValue([userFixture()]);
   updateUserRecord.mockResolvedValue(true);
   deleteUserRecord.mockResolvedValue(true);
@@ -58,18 +66,21 @@ function response() {
 }
 
 for (const handler of [getUsers, getUserById, updateUser, deleteUser]) {
-  test.each([null, "untrusted-user"])(`${handler.name} rejects unauthenticated identity %s before accessing accounts`, async (user) => {
-    const req = request();
-    if (user === null) delete req.user;
-    else req.user = user;
-    const res = response();
+  test.each([null, "untrusted-user"])(
+    `${handler.name} rejects unauthenticated identity %s before accessing accounts`,
+    async (user) => {
+      const req = request();
+      if (user === null) delete req.user;
+      else req.user = user;
+      const res = response();
 
-    await handler(req, res as unknown as Response);
+      await handler(req, res as unknown as Response);
 
-    for (const mock of repositoryCalls) expect(mock).not.toHaveBeenCalled();
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.json).not.toHaveBeenCalledWith(expect.any(Array));
-  });
+      for (const mock of repositoryCalls) expect(mock).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).not.toHaveBeenCalledWith(expect.any(Array));
+    },
+  );
 }
 
 test("blocks the list-all-users endpoint for an authenticated user", async () => {
@@ -111,7 +122,11 @@ test("allows a user to update their own account", async () => {
   await updateUser(request(), res as unknown as Response);
 
   expect(updateUserRecord).toHaveBeenCalledTimes(1);
-  expect(updateUserRecord).toHaveBeenCalledWith("Learner", "learner@example.com", 42);
+  expect(updateUserRecord).toHaveBeenCalledWith(
+    "Learner",
+    "learner@example.com",
+    42,
+  );
   expect(res.status).toHaveBeenCalledWith(200);
   expect(res.send).toHaveBeenCalledWith("User modified with ID: 42");
 });

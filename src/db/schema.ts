@@ -7,6 +7,10 @@ import {
   customType,
   integer,
   bigint,
+  timestamp,
+  primaryKey,
+  uniqueIndex,
+  index,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import pg from "pg";
@@ -29,14 +33,12 @@ export const projects = pgTable(
     name: varchar({ length: 100 }).notNull(),
     description: varchar({ length: 255 }),
     status: varchar({ length: 100 }),
-    createdAt: pgTimestamp("created_at").default(
-      sql`CURRENT_TIMESTAMP`,
-    ),
+    createdAt: pgTimestamp("created_at").default(sql`CURRENT_TIMESTAMP`),
     userId: integer("user_id"),
     // You can use { mode: "bigint" } if numbers are exceeding js number limitations
     taskCacheVersion: bigint("task_cache_version", { mode: "bigint" })
-      .default(0n)
-      .notNull(),
+    .default(sql`0`)
+    .notNull(),
   },
   (table) => [
     foreignKey({
@@ -82,3 +84,50 @@ export const users = pgTable("users", {
   role: varchar({ length: 50 }).default("user"),
   profilePicKey: varchar("profile_pic_key", { length: 255 }),
 });
+
+export const workspaces = pgTable("workspaces", {
+  id: serial().primaryKey(),
+  name: varchar({ length: 100 }).notNull(),
+  createdBy: integer("created_by")
+    .notNull()
+    .references(() => users.id, { onDelete: "restrict" }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});
+
+export const workspaceMembers = pgTable(
+  "workspace_members",
+  {
+    workspaceId: integer("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "restrict" }),
+    role: varchar({
+      length: 10,
+      enum: ["owner", "editor", "viewer"],
+    }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceId, table.userId] }),
+    check(
+      "workspace_members_role_check",
+      sql`${table.role} IN ('owner', 'editor', 'viewer')`,
+    ),
+    uniqueIndex("workspace_members_one_owner")
+      .on(table.workspaceId)
+      .where(sql`${table.role} = 'owner'`),
+    index("workspace_members_user_idx").on(table.userId),
+  ],
+);

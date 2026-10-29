@@ -11,7 +11,7 @@ import userRouter from "./routes/users.routes.ts";
 import errorHandling from "./middleware/error-handling.ts";
 import looger from "./middleware/logger.ts";
 import { login, authenticateJWT } from "./auth/auth-jwt.ts";
-import { createUser } from "./contollers/users.controller.ts";
+import { createUser } from "./controllers/users.controller.ts";
 import {
   createUserValidator,
   loginUserValidator,
@@ -21,6 +21,7 @@ import messageProvider from "./validators/message-provider.ts";
 import parseProfile from "./middleware/parse-profile.ts";
 import requestId from "./middleware/request-id.ts";
 import loginRateLimit from "./middleware/login-rate-limit.ts";
+import workspaceRouter from "./routes/workspaces.routes.ts";
 
 const app: Express = express();
 
@@ -52,6 +53,7 @@ app.get("/error", (req: Request, res: Response) => {
 app.use(authenticateJWT);
 
 // Protected endpoints
+app.use("/workspaces", workspaceRouter);
 app.use("/users/projects", projectRouter);
 app.use("/projects", taskRouter);
 app.use("/users", userRouter);
