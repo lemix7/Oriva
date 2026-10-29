@@ -1,0 +1,70 @@
+name: CI # name of the workflow
+
+on: [push,pull_request] # when to run this workflow
+
+permissions:
+  contents: read # allow read only access
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest # run the workflow on github hosted machine
+    timeout-minutes: 10 # cancel the workflow if it took longer than 10 min
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: oriva_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d oriva_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm #cache npm packages
+
+
+      - run: npm ci # install locked dependencies
+
+      - name: Apply database migrations
+        run: npm run db:migrate
+        env:
+          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/oriva_test
+
+      # .env.test is ignored by Git; create it here using disposable CI database credentials.
+      - name: Configure test database
+        run: echo "TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/oriva_test" > .env.test
+
+      - name: Build and run unit test
+        run: npm test -- --runInBand # run the test script
+
+      - name: type-check database scripts
+        run: npm run typecheck:seed
+
+      # Email retry tests start their own isolated Redis process.
+      - name: Install Redis for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      # Exercise real HTTP login and project ownership checks.
+      - name: Run HTTP flow tests
+        run: npm run test:e2e
+
+      # Verify repeatable seeding and rollback using temporary tables.
+      - name: Run seed tests
+        run: npm run test:seed
