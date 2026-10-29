@@ -122,6 +122,19 @@ async function create(body: unknown, token?: string) {
   });
 }
 
+async function list(token: string, afterId?: number) {
+  const url = new URL("/workspaces", baseUrl);
+
+  if (afterId !== undefined) {
+    url.searchParams.set("afterId", afterId.toString());
+  }
+
+  return fetch(url, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
 async function expectNoWorkspace() {
   const result = await pool!.query(
     "SELECT count(*)::int AS count FROM workspaces WHERE created_by = ANY($1::int[])",
@@ -147,6 +160,89 @@ test("creation trims the name and assigns ownership to the authenticated user", 
     "SELECT user_id, role FROM workspace_members WHERE workspace_id = $1", [body.data.id],
   );
   expect(memberships.rows).toEqual([{ user_id: userIds[0], role: "owner" }]);
+});
+
+test("lists only the authenticated user's workspaces", async () => {
+  const token = await login();
+
+  await create({ name: "Visible workspace" }, token);
+
+  const hiddenWorkspace = await pool!.query(
+    "INSERT INTO workspaces (name, created_by) VALUES ($1, $2) RETURNING id",
+    ["Hidden workspace", userIds[1]],
+  );
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+    [hiddenWorkspace.rows[0].id, userIds[1], "owner"],
+  );
+
+  const response = await list(token);
+  const body = await response.json();
+
+  expect(response.status).toBe(200);
+  expect(body).toEqual({
+    data: [
+      expect.objectContaining({
+        name: "Visible workspace",
+        role: "owner",
+      }),
+    ],
+    page: { nextCursor: null },
+  });
+});
+
+test("returns workspaces in pages of 20", async () => {
+  const token = await login();
+
+  for (let index = 1; index <= 21; index += 1) {
+    const workspace = await pool!.query(
+      "INSERT INTO workspaces (name, created_by) VALUES ($1, $2) RETURNING id",
+      [`Workspace ${index}`, userIds[0]],
+    );
+
+    await pool!.query(
+      "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+      [workspace.rows[0].id, userIds[0], "owner"],
+    );
+  }
+
+  const firstResponse = await list(token);
+  const firstPage = await firstResponse.json();
+
+  expect(firstResponse.status).toBe(200);
+  expect(firstPage.data).toHaveLength(20);
+  expect(firstPage.page.nextCursor).toEqual(expect.any(Number));
+
+  const secondResponse = await list(token, firstPage.page.nextCursor);
+  const secondPage = await secondResponse.json();
+
+  expect(secondResponse.status).toBe(200);
+  expect(secondPage.data).toHaveLength(1);
+  expect(secondPage.page.nextCursor).toBeNull();
+});
+
+test("rejects invalid afterIds", async () => {
+  const token = await login();
+
+  for (const afterId of ["not-a-number", "-1", "1.5"]) {
+    const response = await fetch(
+      `${baseUrl}/workspaces?afterId=${afterId}`,
+      {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+
+    const body = await response.json();
+
+    expect(response.status).toBe(422);
+    expect(body.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "afterId" }),
+      ]),
+    );
+  }
 });
 
 test("authentication runs before name validation and prevents creation", async () => {
