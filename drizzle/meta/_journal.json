@@ -15,6 +15,13 @@
       "when": 1793186496175,
       "tag": "0001_cache-invalidation",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793272504093,
+      "tag": "0002_workspaces",
+      "breakpoints": true
     }
   ]
 }

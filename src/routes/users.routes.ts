@@ -1,6 +1,6 @@
 import express, { type Response, type Request, type Express } from "express";
 import pool from "../pool/pooler.ts";
-import * as db from "../contollers/users.controller.ts";
+import * as db from "../controllers/users.controller.ts";
 
 const router = express.Router();
 

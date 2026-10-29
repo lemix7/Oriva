@@ -1,5 +1,5 @@
 import express, { type Response, type Request, type Express } from "express";
-import * as db from "../contollers/projects.controller.ts";
+import * as db from "../controllers/projects.controller.ts";
 import createProjectValidator from "../validators/projects.validator.ts";
 import messageProvider from "../validators/message-provider.ts";
 import validate from "../middleware/validate.ts";
