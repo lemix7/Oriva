@@ -2,15 +2,12 @@ import mutler from "multer";
 import mutlerS3 from "multer-s3";
 import { randomUUID } from "node:crypto";
 import s3 from "../S3/s3.ts";
+import { requiredEnv } from "../config/env.ts";
 
-const bucket = process.env.AWS_BUCKET_NAME;
-
-if (!bucket) {
-  throw new Error("AWS_BUCKET_NAME is missing");
-}
+const bucket = requiredEnv("AWS_BUCKET_NAME");
 
 const upload = mutler({
-  
+
   storage: mutlerS3({
     s3,
     bucket,
@@ -27,4 +24,3 @@ const upload = mutler({
 });
 
 export default upload;
- 

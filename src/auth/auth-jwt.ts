@@ -1,14 +1,12 @@
 import jwt from "jsonwebtoken";
 import { type NextFunction, type Request, type Response } from "express";
-import pool from "../pool/pooler.ts";
 import bcrypt from "bcryptjs";
-import dotenv from "dotenv";
+import { requiredEnv } from "../config/env.ts";
 import { loginUserSchema } from "../validators/users.validator.ts";
 import vine, { errors } from "@vinejs/vine";
+import { findUserByEmail } from "../repositories/user.repository.ts";
 
-dotenv.config();
-
-const SECRET_KEY = process.env.SECRET_KEY;
+const SECRET_KEY = requiredEnv("SECRET_KEY");
 
 const login = async (req: Request, res: Response) => {
   const { email, password } = req.body;
@@ -16,22 +14,12 @@ const login = async (req: Request, res: Response) => {
   try {
     const validator = vine.compile(loginUserSchema);
     const output = await validator.validate(req.body);
-    
-    
-    const results = await pool.query(
-      "SELECT id , password FROM users WHERE email = $1",
-      [email],
-    );
 
-    if (results.rows.length == 0) {
+    const user = await findUserByEmail(email);
+
+    if (!user) {
       return res.status(401).send("Invalid credentials");
     }
-
-    if (!SECRET_KEY) {
-      throw new Error("SECRET KEY is missing");
-    }
-
-    const user = results.rows[0];
 
     const isValid = await bcrypt.compare(password, user.password);
 
@@ -53,24 +41,22 @@ const login = async (req: Request, res: Response) => {
       token: token,
     });
   } catch (error) {
-    if(error instanceof errors.E_VALIDATION_ERROR){
-      res.status(error.status).send(error.message)
+    if (error instanceof errors.E_VALIDATION_ERROR) {
+      res.status(error.status).send(error.message);
     }
-    throw error
+    throw error;
   }
 };
 
-const authenticateJWT = async (req: Request, res: Response, next: NextFunction) => {
-  
-
+const authenticateJWT = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer")
     ? authHeader.slice(7)
     : undefined;
-
-  if (!SECRET_KEY) {
-    throw new Error("SECRET KEY is missing");
-  }
 
   if (token) {
     jwt.verify(token, SECRET_KEY, (err, user) => {

@@ -93,7 +93,16 @@ npm start
 
 The default base URL is `http://localhost:4000`.
 
-The email worker starts inside the API process from `src/index.ts`. No separate worker command is needed. `src/app.ts` exports the Express app for HTTP tests.
+Run the email worker in a separate terminal with `npm run dev:worker` during
+development, or `npm run worker` after building. `src/index.ts` starts only the
+HTTP API; `src/app.ts` exports the app for HTTP tests. Jobs wait in Redis while
+the worker is stopped.
+
+For Docker, run `docker compose up -d --build app worker`. Compose starts Redis
+as their dependency. Both containers use the same image; the worker overrides
+the startup command and has no HTTP port. Redis is exposed only on loopback
+port 6379 for local development. Keep dollar-containing `.env` values such as
+`SECRET_KEY` single-quoted so Compose preserves them literally.
 
 ## API endpoints
 
@@ -203,10 +212,10 @@ src/
 ├── validators/    # VineJS schemas
 ├── workers/       # Email queue processor
 ├── app.ts         # Express app configuration and export
-└── index.ts       # HTTP server and email worker startup
+└── index.ts       # HTTP server startup
 ```
 
-Controllers handle HTTP requests and responses. Repositories contain SQL. The profile storage adapter translates upload and deletion operations into AWS SDK commands.
+Controllers handle HTTP requests and responses. Repositories use Drizzle to build database queries. The profile storage adapter translates upload and deletion operations into AWS SDK commands.
 
 ## Email behavior
 
@@ -214,7 +223,22 @@ Registration notifications currently go to a fixed recipient configured in `src/
 
 If saving a user fails after an upload succeeds, registration attempts to delete the uploaded picture. Once the user is saved, a rejected notification enqueue is logged and registration still succeeds. Failed enqueueing is not persisted for later retry; Redis connection retries can also delay the response.
 
+New email jobs allow three total attempts with exponential backoff (1 second,
+then 2 seconds). The service makes one provider request per attempt. Temporary
+failures remain retryable; permanent provider errors use `UnrecoverableError`
+to stop immediately. The worker reuses a queue/job/timestamp-based idempotency
+key across attempts. Resend retains these keys for 24 hours, so this is not an
+unlimited guarantee against duplicate delivery.
+
 ## Verification and development notes
+
+`src/config/env.ts` loads environment settings once and provides `requiredEnv`.
+Database access requires `DATABASE_URL`; authentication requires `SECRET_KEY`;
+the email worker requires `RESEND_API_KEY`; profile storage requires
+`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_BUCKET_NAME`.
+Each component checks its settings when initialized. Missing or whitespace-only
+values produce an error naming the setting without printing its value. Existing
+defaults for `PORT`, `REDIS_HOST`, and `REDIS_PORT` remain available.
 
 Check TypeScript without generating build output:
 
@@ -226,12 +250,96 @@ Tests compile TypeScript before running Jest:
 
 ```bash
 npm test                  # Unit tests; no external services required
-npm run test:integration   # Repository tests against real PostgreSQL
+npm run test:integration   # PostgreSQL repositories and isolated Redis email retries
 npm run test:e2e           # Real HTTP login and project ownership flow
 ```
 
 Database-backed tests require `.env.test` with `TEST_DATABASE_URL` pointing to the local `oriva_test` database and the application schema installed. This local file is ignored by Git. Tests refuse other database names and non-local hosts, create their own fixtures, and delete those fixtures afterward.
 
+Email retry integration tests also require `redis-server` on PATH (or a
+`REDIS_SERVER_BINARY` executable path). They start a temporary Redis process
+with a private Unix socket, no network listener, and no persistence. The actual
+queue, worker, and email service run against it, while Resend is mocked. Tests
+check exhaustion after three attempts, exponential delays, immediate permanent
+failure, successful recovery, and stable idempotency keys. They close all clients,
+stop Redis, and remove their temporary files afterward. No real emails are sent.
+
 The HTTP suite starts the app on an available loopback port and uses real password checks, JWTs, routes, controllers, and PostgreSQL. Email queuing, cloud uploads, and Redis are mocked; they are not covered by this flow. The HTTP server and database pool are closed when testing finishes.
 
 The public `GET /error` route intentionally throws an error to exercise error handling. Remove or restrict it before deployment.
+
+## Lakebase Postgres via Neon
+
+Neon connection strings are stored in the git-ignored `.env.neon` file.
+Keep the SSL parameters supplied by Neon. Do not commit or print connection strings.
+
+`schema.sql` is a schema-only snapshot of the current local application database,
+including tables, sequences, constraints, indexes, and cache functions/triggers.
+It includes the changes from migrations 001–003; do not replay those on top of
+this baseline. The snapshot was imported into Neon without existing user,
+project, or task rows. It does not include the future workspace blueprint.
+Express uses Neon's pooled connection through `DATABASE_URL` in `.env`.
+Docker uses the same Neon connection through `DOCKER_DATABASE_URL`.
+Previous local URLs are preserved as `LOCAL_DATABASE_URL` and
+`LOCAL_DOCKER_DATABASE_URL`; integration and HTTP tests retain their separate
+local test database. The Docker app requires Redis but no longer waits for
+local PostgreSQL. Restart a running API process or recreate the app container
+to load the new connection settings.
+
+The Neon CLI was installed under the existing Node 22 installation. If your
+shell cannot find it, first run `nvm use 22.23.2`.
+
+## Drizzle repositories
+
+Project, task, and user repositories use the shared Drizzle client in
+`src/db/index.ts`, backed by the existing `pg` pool. Explicit projections retain
+the API's snake_case fields, and cache versions are serialized as strings.
+Task updates and deletes include the ownership check in the same SQL statement.
+Task reads retain the previous flat join response, including project values
+for column names shared by projects and tasks.
+
+The schema's custom date mappings reuse `pg` parsers so existing timestamps
+and date values keep their previous JavaScript types and timezone behavior.
+The database schema and cache triggers are unchanged. Login uses the Drizzle-backed
+`findUserByEmail` repository function; password checks and JWT behavior are unchanged.
+
+## Local demo seed
+
+After applying both Drizzle migrations to an empty local `oriva_migration_test`
+database, run `npm run db:seed`. The script reads `TEST_DATABASE_URL` from
+`.env.test` (an existing environment value takes priority), reuses its local
+credentials, and always targets `oriva_migration_test`. It refuses remote hosts.
+It does not create the database or run migrations.
+
+The seed creates a Demo Owner (`demo.owner@example.com`, local demo password
+`LocalDemo123!`), one active Demo Project, and two tasks: Plan the project (done)
+and Build the first feature (on progress). The password is stored as a bcrypt
+hash. New projects/tasks use January 1, 2026 as their creation date. IDs remain
+database-generated.
+
+All inserts commit together or roll back on failure. A transaction-scoped lock
+serializes simultaneous seed runs. Reruns reuse demo records by email,
+owner/project name, and project/task title, preserving edits and passwords;
+missing demo records are recreated. Renaming those identifying fields makes
+the original demo record missing, so the next run recreates it. The script
+does not delete records, send email, access Redis/S3, or connect to Neon.
+
+Run `npm run typecheck:seed` to check the scripts and `npm run test:seed` for
+regression coverage. Seed tests require the existing local `oriva_test` schema
+and use connection-private temporary tables and sequences, removed on disconnect.
+
+## Request tracing
+
+Login requests are limited to 10 per IP address per 15 minutes, before login
+validation and password checking. Further requests return 429 with a request ID
+and `Retry-After` header. Counts use process memory: restarting the API resets
+them, and multiple API processes do not share counts.
+
+Every request receives a server-generated `X-Request-ID`. The request logger
+records that ID, timestamp, method, full path without the query string, response
+status, and duration as JSON after the response finishes. It does not log request
+bodies or headers.
+
+The central error handler includes `requestId` in malformed JSON (400), validation
+(422), and unexpected error (500) responses. Unexpected errors produce a matching
+JSON error log without exposing the error message to clients or logs.

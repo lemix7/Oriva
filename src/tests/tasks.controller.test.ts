@@ -1,5 +1,6 @@
 import { beforeEach, expect, jest, test } from "@jest/globals";
 import type { Request, Response } from "express";
+import { joinedTaskFixture, projectFixture, taskFixture } from "./fixtures.ts";
 
 const findOwnedProject =
   jest.fn<typeof import("../repositories/task.repository.ts").findOwnedProject>();
@@ -67,9 +68,9 @@ test("rejects task creation when the user does not own the project", async () =>
 
 test("creates a task in an owned project and returns a 201 success message", async () => {
   // Arrange: ownership is confirmed and the insert succeeds.
-  findOwnedProject.mockResolvedValue({ id: 7, user_id: 42 });
+  findOwnedProject.mockResolvedValue(projectFixture());
   insertTask.mockResolvedValue([
-    { id: 10, title: "Write tests", project_id: 7 },
+    taskFixture(),
   ]);
   const req = {
     user: { userId: 42 },
@@ -145,7 +146,7 @@ test.each([{ tasks: [] }, { tasks: [{ id: 10 }] }])("lists only results returned
 });
 
 test("single-task lookup passes the authenticated owner, project and task IDs", async () => {
-  const tasks = [{ id: 10 }];
+  const tasks = [joinedTaskFixture()];
   findTaskForUser.mockResolvedValue(tasks);
   const res = taskResponse();
   await get_task_by_Id(taskRequest(), res as unknown as Response);
@@ -196,7 +197,7 @@ test("ownership lookup failure prevents task insertion and a success response", 
 });
 
 test("task insertion failure does not send the creation success message", async () => {
-  findOwnedProject.mockResolvedValue({ id: 7, user_id: 42 });
+  findOwnedProject.mockResolvedValue(projectFixture());
   const error = new Error("insert failed");
   insertTask.mockRejectedValue(error);
   const res = taskResponse();

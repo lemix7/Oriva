@@ -1,13 +1,13 @@
 import { Resend } from "resend";
-import { randomUUID } from "node:crypto";
-import dotenv from "dotenv";
-import { setTimeout as delay } from "node:timers/promises";
+import { requiredEnv } from "../config/env.ts";
+import { UnrecoverableError } from "bullmq";
 
-dotenv.config();
+const resend = new Resend(requiredEnv("RESEND_API_KEY"));
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-const newUserEmail = async function (user_name: string) {
+const newUserEmail = async function (
+  user_name: string,
+  idempotencyKey: string,
+) {
   const email = "ahmedgeger@gmail.com";
   const from = "My App <onboarding@resend.dev>";
   const safeUserName = user_name.replace(/[&<>"']/g, (character) => {
@@ -21,10 +21,6 @@ const newUserEmail = async function (user_name: string) {
     return entities[character]!;
   });
 
-  const base_delay = 1000;
-  const max_retries = 4;
-  const max_wait = 30_000;
-  const idempotencyKey = randomUUID();
   const payload = {
     from,
     to: email,
@@ -38,48 +34,31 @@ const newUserEmail = async function (user_name: string) {
     `,
   };
 
-  try {
-    for (let attempt = 0; attempt <= max_retries; attempt++) {
-      const signal = AbortSignal.timeout(5000);
-      const { data, error, headers } = await resend.emails.send(payload, {
-        signal,
-        idempotencyKey,
-      });
+  const { data, error } = await resend.emails.send(payload, {
+    signal: AbortSignal.timeout(5000),
+    idempotencyKey,
+  });
 
-      if (!error) {
-        return data;
-      }
+  if (error) {
+    const retryable =
+      error.statusCode === null ||
+      error.statusCode === 408 ||
+      error.name === "rate_limit_exceeded" ||
+      error.name === "concurrent_idempotent_requests" ||
+      (error.statusCode !== null && error.statusCode >= 500);
 
-      console.error(`Email attempt ${attempt + 1} failed:`, error.message);
-
-      const retryable =
-        (error.statusCode === null &&
-          (signal.aborted || error.name === "application_error")) ||
-        error.statusCode === 429 ||
-        (error.statusCode !== null && error.statusCode >= 500);
-
-      // when to not retry
-      if (!retryable || attempt === max_retries) {
-        return null;
-      }
-
-      let wait_time = base_delay * 2 ** attempt;
-
-      // when to stop
-      if (wait_time > max_wait) {
-        console.error(
-          "Email retry delay exceeds the limit; skipping notification.",
-        );
-        return null;
-      }
-
-      await delay(wait_time);
+    if (!retryable) {
+      throw new UnrecoverableError(error.message);
     }
-  } catch (error) {
-    console.error("Email service failed", error);
+
+    throw new Error(error.message);
   }
 
-  return null;
+  if (!data) {
+    throw new Error("Email provider returned no result");
+  }
+
+  return data;
 };
 
 export default newUserEmail;

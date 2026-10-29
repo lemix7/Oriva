@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+import "./config/env.ts";
 import express, {
   type Response,
   type Request,
@@ -19,26 +19,31 @@ import {
 import validate from "./middleware/validate.ts";
 import messageProvider from "./validators/message-provider.ts";
 import parseProfile from "./middleware/parse-profile.ts";
-
-dotenv.config();
+import requestId from "./middleware/request-id.ts";
+import loginRateLimit from "./middleware/login-rate-limit.ts";
 
 const app: Express = express();
 
-app.use(express.json());
+app.use(requestId);
 app.use(looger);
+app.use(express.json());
 
 // Public endpoints no token required
 app.get("/", (req: Request, res: Response) => {
   res.status(200).json("Hello world");
 });
-app.use("/login", validate(loginUserValidator, messageProvider), login);
+app.use(
+  "/login",
+  loginRateLimit,
+  validate(loginUserValidator, messageProvider),
+  login,
+);
 app.post(
   "/users",
   parseProfile.single("profilePic"),
   validate(createUserValidator, messageProvider),
   createUser,
 );
-
 
 app.get("/error", (req: Request, res: Response) => {
   throw new Error("testing the error middleware");

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict OlpjPsbUIi8KndBPDpo62rshDUQI5YIMSYQEuARpLFShf8HhTW0evfUZebjaTDF
+\restrict NOdjE1NeAs4g17zfknNnA2t5rObXHMub0gSSRL6RrGkPahhFtjcNe9hA0e4BU3E
 
 -- Dumped from database version 17.11 (Homebrew)
 -- Dumped by pg_dump version 17.11 (Homebrew)
@@ -18,6 +18,20 @@ SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
+
+--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA IF NOT EXISTS public;
+
+
+--
+-- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON SCHEMA public IS 'standard public schema';
+
 
 --
 -- Name: bump_project_task_cache_version(); Type: FUNCTION; Schema: public; Owner: -
@@ -256,5 +270,5 @@ ALTER TABLE ONLY public.tasks
 -- PostgreSQL database dump complete
 --
 
-\unrestrict OlpjPsbUIi8KndBPDpo62rshDUQI5YIMSYQEuARpLFShf8HhTW0evfUZebjaTDF
+\unrestrict NOdjE1NeAs4g17zfknNnA2t5rObXHMub0gSSRL6RrGkPahhFtjcNe9hA0e4BU3E
 

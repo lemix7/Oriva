@@ -1,5 +1,6 @@
 import { beforeEach, expect, jest, test } from "@jest/globals";
 import type { Request, Response } from "express";
+import { userFixture } from "./fixtures.ts";
 
 type Repository = typeof import("../repositories/user.repository.ts");
 const findAllUsers = jest.fn<Repository["findAllUsers"]>();
@@ -34,8 +35,8 @@ beforeEach(() => {
   for (const mock of repositoryCalls) mock.mockReset();
   // Successful defaults ensure rejection tests cannot pass because of an
   // unrelated database error or a missing record.
-  findAllUsers.mockResolvedValue([{ id: 99, name: "Another user" }]);
-  findUsersById.mockResolvedValue([{ id: 42, name: "Learner" }]);
+  findAllUsers.mockResolvedValue([userFixture({ id: 99, name: "Another user", email: "another@example.com" })]);
+  findUsersById.mockResolvedValue([userFixture()]);
   updateUserRecord.mockResolvedValue(true);
   deleteUserRecord.mockResolvedValue(true);
 });
@@ -102,7 +103,7 @@ test("allows a user to read their own account", async () => {
   expect(findUsersById).toHaveBeenCalledTimes(1);
   expect(findUsersById).toHaveBeenCalledWith(42);
   expect(res.status).toHaveBeenCalledWith(200);
-  expect(res.json).toHaveBeenCalledWith([{ id: 42, name: "Learner" }]);
+  expect(res.json).toHaveBeenCalledWith([userFixture()]);
 });
 
 test("allows a user to update their own account", async () => {

@@ -1,21 +1,51 @@
-import pool from "../pool/pooler.ts";
+import { db } from "../db/index.ts";
+import { projects } from "../db/schema.ts";
+import { and, desc, eq } from "drizzle-orm";
 
 export async function getAllProject(userId: number) {
-  const results = await pool.query(
-    "SELECT * FROM projects WHERE user_id = $1 ORDER BY created_at DESC",
-    [userId],
-  );
+  const rows = await db
+    .select({
+      id: projects.id,
+      name: projects.name,
+      description: projects.description,
+      status: projects.status,
+      created_at: projects.createdAt,
+      user_id: projects.userId,
+      task_cache_version: projects.taskCacheVersion,
+    })
+    .from(projects)
+    .where(eq(projects.userId, userId))
+    .orderBy(desc(projects.createdAt));
 
-  return results.rows;
+  return rows.map((row) => ({
+    ...row,
+    task_cache_version: row.task_cache_version.toString(),
+  }));
 }
 
-export async function getProjectsByUserId(userId: number , projectId:number ) {
-  const results = await pool.query(
-    "SELECT * FROM projects WHERE id = $1 AND user_id = $2",
-    [projectId, userId],
-  );
+export async function getProjectsByUserId(userId: number, projectId: number) {
+  const rows = await db
+    .select({
+      id: projects.id,
+      name: projects.name,
+      description: projects.description,
+      status: projects.status,
+      created_at: projects.createdAt,
+      user_id: projects.userId,
+      task_cache_version: projects.taskCacheVersion,
+    })
+    .from(projects)
+    .where(and(eq(projects.id, projectId), eq(projects.userId, userId)))
+    .limit(1);
 
-  return results.rows[0] ?? null;
+  const project = rows[0];
+
+  return project
+    ? {
+        ...project,
+        task_cache_version: project.task_cache_version.toString(),
+      }
+    : null;
 }
 
 export async function createProject(
@@ -24,31 +54,76 @@ export async function createProject(
   status: string,
   userId: number,
 ) {
-  const results = await pool.query(
-    "INSERT INTO projects (name , description , status , user_id) VALUES ($1 , $2 , $3 , $4) RETURNING *",
-    [name, description, status, userId],
-  );
+  const [project] = await db
+    .insert(projects)
+    .values({ name, description, status, userId })
+    .returning({
+      id: projects.id,
+      name: projects.name,
+      description: projects.description,
+      status: projects.status,
+      created_at: projects.createdAt,
+      user_id: projects.userId,
+      task_cache_version: projects.taskCacheVersion,
+    });
 
-  return results.rows[0];
+  return {
+    ...project,
+    task_cache_version: project.task_cache_version.toString(),
+  };
 }
 
 export async function updateProject(
-  c: string,
-  project_id: number,
+  status: string,
+  projectId: number,
   userId: number,
 ) {
-  const results = await pool.query(
-    "UPDATE projects SET status = $1 WHERE id = $2 AND user_id = $3 RETURNING *",
-    [c, project_id, userId],
-  );
-  return results.rows[0] ?? null;
+  const [project] = await db
+    .update(projects)
+    .set({ status })
+    .where(and(eq(projects.id, projectId), eq(projects.userId, userId)))
+    .returning({
+      id: projects.id,
+      name: projects.name,
+      description: projects.description,
+      status: projects.status,
+      created_at: projects.createdAt,
+      user_id: projects.userId,
+      task_cache_version: projects.taskCacheVersion,
+    });
+
+  return project
+    ? {
+        ...project,
+        task_cache_version: project.task_cache_version.toString(),
+      }
+    : null;
 }
 
-export async function deleteProject(userId: number, project_id: number) {
-  const results = await pool.query(
-    "DELETE FROM projects WHERE id = $1 AND user_id = $2 RETURNING *",
-    [project_id, userId],
-  );
+export async function deleteProject(
+  userId: number,
+  projectId: number,
+) {
+  const [project] = await db
+    .delete(projects)
+    .where(and(
+      eq(projects.id, projectId),
+      eq(projects.userId, userId),
+    ))
+    .returning({
+      id: projects.id,
+      name: projects.name,
+      description: projects.description,
+      status: projects.status,
+      created_at: projects.createdAt,
+      user_id: projects.userId,
+      task_cache_version: projects.taskCacheVersion,
+    });
 
-  return results.rows[0] ?? null;
+  return project
+    ? {
+        ...project,
+        task_cache_version: project.task_cache_version.toString(),
+      }
+    : null;
 }

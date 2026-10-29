@@ -1,26 +1,57 @@
-import pool from "../pool/pooler.ts";
+import { and, eq, inArray } from "drizzle-orm";
+import { db } from "../db/index.ts";
+import { projects, tasks } from "../db/schema.ts";
 
-export async function findTaskCacheVersion(
-  userId: number,
-  projectId: string | string[],
-) {
-  const result = await pool.query(
-    `SELECT task_cache_version::text FROM projects WHERE user_id = $1 AND id = $2`,
-    [userId, projectId],
-  );
+const projectFields = {
+  id: projects.id,
+  name: projects.name,
+  description: projects.description,
+  status: projects.status,
+  created_at: projects.createdAt,
+  user_id: projects.userId,
+  task_cache_version: projects.taskCacheVersion,
+};
 
-  return result.rows[0]?.task_cache_version ?? null;
+const taskFields = {
+  id: tasks.id,
+  title: tasks.title,
+  project_id: tasks.projectId,
+  description: tasks.description,
+  status: tasks.status,
+  created_at: tasks.createdAt,
+};
+
+// Preserve the old SELECT * join's flat response: project columns win when
+// both tables have an id, description, status, or created_at column.
+const joinedFields = { ...taskFields, ...projectFields };
+
+function routeId(value: string | string[]): number {
+  if (typeof value !== "string" || !/^\s*[+-]?\d+\s*$/.test(value)) {
+    throw new Error("Invalid database ID");
+  }
+  const id = Number(value);
+  if (!Number.isInteger(id) || id < -2147483648 || id > 2147483647) {
+    throw new Error("Invalid database ID");
+  }
+  return id;
 }
 
-export async function findTasksForUser(
-  userId: number,
-  projectId: string | string[],
-) {
-  const result = await pool.query(
-    "SELECT * FROM tasks t INNER JOIN projects p on t.project_id = p.id WHERE p.user_id = $1 AND p.id = $2 ",
-    [userId, projectId],
-  );
-  return result.rows;
+export async function findTaskCacheVersion(userId: number, projectId: string | string[]): Promise<string | null> {
+  const [project] = await db
+    .select({ version: projects.taskCacheVersion })
+    .from(projects)
+    .where(and(eq(projects.userId, userId), eq(projects.id, routeId(projectId))))
+    .limit(1);
+  return project?.version.toString() ?? null;
+}
+
+export async function findTasksForUser(userId: number, projectId: string | string[]) {
+  const rows = await db
+    .select(joinedFields)
+    .from(tasks)
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(eq(projects.userId, userId), eq(projects.id, routeId(projectId))));
+  return rows.map((row) => ({ ...row, task_cache_version: row.task_cache_version.toString() }));
 }
 
 export async function findTaskForUser(
@@ -28,22 +59,27 @@ export async function findTaskForUser(
   projectId: string | string[],
   taskId: string | string[],
 ) {
-  const result = await pool.query(
-    "SELECT * FROM tasks t INNER JOIN projects p on t.project_id = p.id WHERE p.user_id = $1 AND p.id = $2 AND t.id = $3",
-    [userId, projectId, taskId],
-  );
-  return result.rows;
+  const rows = await db
+    .select(joinedFields)
+    .from(tasks)
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(
+      eq(projects.userId, userId),
+      eq(projects.id, routeId(projectId)),
+      eq(tasks.id, routeId(taskId)),
+    ));
+  return rows.map((row) => ({ ...row, task_cache_version: row.task_cache_version.toString() }));
 }
 
-export async function findOwnedProject(
-  projectId: string | string[],
-  userId: number,
-) {
-  const result = await pool.query(
-    "SELECT * FROM projects WHERE id = $1 AND user_id = $2",
-    [projectId, userId],
-  );
-  return result.rows[0] ?? null;
+export async function findOwnedProject(projectId: string | string[], userId: number) {
+  const [project] = await db
+    .select(projectFields)
+    .from(projects)
+    .where(and(eq(projects.id, routeId(projectId)), eq(projects.userId, userId)))
+    .limit(1);
+  return project
+    ? { ...project, task_cache_version: project.task_cache_version.toString() }
+    : null;
 }
 
 export async function insertTask(
@@ -52,11 +88,10 @@ export async function insertTask(
   status: string,
   projectId: string | string[],
 ) {
-  const result = await pool.query(
-    "INSERT INTO tasks (title , description , status , project_id) VALUES ($1 , $2 , $3 , $4) RETURNING * ",
-    [title, description, status, projectId],
-  );
-  return result.rows;
+  return db
+    .insert(tasks)
+    .values({ title, description: description ?? null, status: status ?? null, projectId: routeId(projectId) })
+    .returning(taskFields);
 }
 
 export async function updateTaskForUser(
@@ -65,11 +100,12 @@ export async function updateTaskForUser(
   userId: number,
   projectId: string | string[],
 ) {
-  const result = await pool.query(
-    "UPDATE tasks t  SET status = $1 FROM projects p WHERE t.project_id = p.id AND t.id = $2 AND p.user_id = $3 AND p.id = $4",
-    [update, taskId, userId, projectId],
-  );
-  return result.rowCount !== 0;
+  const ownedProject = db.select({ id: projects.id }).from(projects)
+    .where(and(eq(projects.id, routeId(projectId)), eq(projects.userId, userId)));
+  const rows = await db.update(tasks).set({ status: update })
+    .where(and(eq(tasks.id, routeId(taskId)), inArray(tasks.projectId, ownedProject)))
+    .returning({ id: tasks.id });
+  return rows.length > 0;
 }
 
 export async function deleteTaskForUser(
@@ -77,9 +113,10 @@ export async function deleteTaskForUser(
   projectId: string | string[],
   taskId: string | string[],
 ) {
-  const result = await pool.query(
-    "DELETE FROM tasks t USING projects p WHERE t.project_id = p.id AND p.user_id = $1 AND p.id = $2 AND t.id = $3",
-    [userId, projectId, taskId],
-  );
-  return result.rowCount !== 0;
+  const ownedProject = db.select({ id: projects.id }).from(projects)
+    .where(and(eq(projects.id, routeId(projectId)), eq(projects.userId, userId)));
+  const rows = await db.delete(tasks)
+    .where(and(eq(tasks.id, routeId(taskId)), inArray(tasks.projectId, ownedProject)))
+    .returning({ id: tasks.id });
+  return rows.length > 0;
 }

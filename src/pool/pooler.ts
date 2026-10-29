@@ -1,17 +1,10 @@
-import dotenv from "dotenv";
-import pg from "pg"
+import pg from "pg";
+import { requiredEnv } from "../config/env.ts";
 
-
-dotenv.config()
-
-const { Pool } = pg
-
-if(!process.env.DATABASE_URL) {
-  throw new Error("DATABASE_URL is missing")
-}
+const { Pool } = pg;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
-})
+  connectionString: requiredEnv("DATABASE_URL"),
+});
 
-export default pool 
+export default pool;

@@ -8,6 +8,7 @@ let pool: Pool | undefined;
 let findTaskForUser: typeof import("../../repositories/task.repository.ts").findTaskForUser;
 let updateTaskForUser: typeof import("../../repositories/task.repository.ts").updateTaskForUser;
 let deleteTaskForUser: typeof import("../../repositories/task.repository.ts").deleteTaskForUser;
+let repository: typeof import("../../repositories/task.repository.ts");
 const originalDatabaseUrl = process.env.DATABASE_URL;
 const userIds: number[] = [];
 const projectIds: number[] = [];
@@ -35,6 +36,7 @@ beforeAll(async () => {
   process.env.DATABASE_URL = testDatabaseUrl;
   ({ default: pool } = await import("../../pool/pooler.ts"));
   ({ findTaskForUser, updateTaskForUser, deleteTaskForUser } = await import("../../repositories/task.repository.ts"));
+  repository = await import("../../repositories/task.repository.ts");
   const result = await pool.query("SELECT current_database() AS database");
   expect(result.rows[0].database).toBe("oriva_test");
 });
@@ -165,4 +167,47 @@ test("user B can delete their own task without deleting the other task", async (
   expect(result.rows).toEqual([
     { id: taskIds[1], title: "Other task", status: "on progress" },
   ]);
+});
+
+
+test("task list and lookup preserve the previous flat joined response", async () => {
+  const previous = await pool!.query(
+    "SELECT * FROM tasks t INNER JOIN projects p ON t.project_id = p.id WHERE p.user_id = $1 AND p.id = $2 ORDER BY t.title",
+    [userBId, projectId],
+  );
+  const rows = await repository.findTasksForUser(userBId, String(projectId));
+  expect(rows.sort((a, b) => a.title.localeCompare(b.title))).toEqual(previous.rows);
+  expect(await repository.findTasksForUser(userAId, String(projectId))).toEqual([]);
+  expect(await repository.findTaskForUser(userBId, String(projectId), String(taskId)))
+    .toEqual(previous.rows.filter((row) => row.title === "Requested task"));
+});
+
+test("owned-project lookup and cache version reject another owner", async () => {
+  expect(await repository.findOwnedProject(String(projectId), userAId)).toBeNull();
+  expect(await repository.findTaskCacheVersion(userAId, String(projectId))).toBeNull();
+  const previous = await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId]);
+  expect(await repository.findOwnedProject(String(projectId), userBId)).toEqual(previous.rows[0]);
+  expect(await repository.findTaskCacheVersion(userBId, String(projectId)))
+    .toBe(previous.rows[0].task_cache_version);
+});
+
+test("task insertion returns its row and advances the live cache version", async () => {
+  const before = await repository.findTaskCacheVersion(userBId, String(projectId));
+  const rows = await repository.insertTask("New task", undefined, "on progress", String(projectId));
+  for (const row of rows) taskIds.push(row.id);
+  expect(rows).toHaveLength(1);
+  const previous = await pool!.query("SELECT * FROM tasks WHERE id = $1", [rows[0]!.id]);
+  expect(rows).toEqual(previous.rows);
+  expect(rows[0]).toMatchObject({ title: "New task", description: null, project_id: projectId });
+  expect(await repository.findTaskCacheVersion(userBId, String(projectId)))
+    .toBe((BigInt(before!) + 1n).toString());
+});
+
+test("missing task mutations return false and invalid route IDs do not become valid IDs", async () => {
+  expect(await repository.updateTaskForUser("done", "-1", userBId, String(projectId))).toBe(false);
+  expect(await repository.deleteTaskForUser(userBId, String(projectId), "-1")).toBe(false);
+  await expect(repository.findTaskForUser(userBId, [String(projectId)], String(taskId)))
+    .rejects.toThrow("Invalid database ID");
+  await expect(repository.findTaskForUser(userBId, String(projectId), "1e1"))
+    .rejects.toThrow("Invalid database ID");
 });
