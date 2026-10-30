@@ -15,6 +15,10 @@ const validate = (
     });
 
     res.locals.validatedData = output;
+
+    if (source === "params") {
+      res.locals.validatedParams = output;
+    }
     next();
   };
 };

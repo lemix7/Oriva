@@ -1,4 +1,4 @@
-import { workspaces, workspaceMembers } from "../db/schema.ts";
+import { workspaces, workspaceMembers, users } from "../db/schema.ts";
 import { db } from "../db/index.ts";
 import { and, asc, eq, gt } from "drizzle-orm";
 
@@ -85,3 +85,27 @@ export async function getWorkspaceById(workspaceId: number) {
 
   return workspace;
 }
+
+export const MEMBER_PAGE_SIZE = 20;
+
+export async function getWorkspaceMembers(
+  workspaceId: number,
+  afterUserId = 0,
+) {
+  return db
+    .select({
+      userId: workspaceMembers.userId,
+      name: users.name,
+      role: workspaceMembers.role,
+    })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(workspaceMembers.userId, users.id))
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        gt(workspaceMembers.userId, afterUserId),
+      ),
+    )
+    .orderBy(asc(workspaceMembers.userId))
+    .limit(MEMBER_PAGE_SIZE + 1);
+} 

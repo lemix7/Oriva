@@ -100,11 +100,11 @@ afterAll(async () => {
   }
 });
 
-async function login(): Promise<string> {
+async function login(email = ownerEmail): Promise<string> {
   const response = await fetch(`${baseUrl}/login`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email: ownerEmail, password }),
+    body: JSON.stringify({ email, password }),
     signal: AbortSignal.timeout(5000),
   });
   const body = await response.json();
@@ -233,6 +233,167 @@ test("rejects invalid workspace IDs", async () => {
         expect.objectContaining({ field: "wid" }),
       ]),
     );
+  }
+});
+
+test("a member can list workspace teammates and roles", async () => {
+  const token = await login();
+  const created = await create({ name: "Team workspace" }, token);
+
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+    [workspace.id, userIds[1], "viewer"],
+  );
+
+  const response = await fetch(
+    `${baseUrl}/workspaces/${workspace.id}/members`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    data: [
+      {
+        userId: userIds[0],
+        name: "Workspace owner fixture",
+        role: "owner",
+      },
+      {
+        userId: userIds[1],
+        name: "Workspace other fixture",
+        role: "viewer",
+      },
+    ],
+    page: { nextCursor: null },
+  });
+});
+
+test("a non-member cannot list workspace members", async () => {
+  const token = await login();
+
+  const result = await pool!.query(
+    "INSERT INTO workspaces (name, created_by) VALUES ($1, $2) RETURNING id",
+    ["Private workspace", userIds[1]],
+  );
+  const workspaceId = result.rows[0].id;
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+    [workspaceId, userIds[1], "owner"],
+  );
+
+  const response = await fetch(
+    `${baseUrl}/workspaces/${workspaceId}/members`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace not found",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+});
+
+test("paginates workspace members without repeating or skipping anyone", async () => {
+  const token = await login();
+  const created = await create({ name: "Paginated team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  const prefix = randomUUID().replace(/-/g, "").slice(0, 12);
+  const inserted = await pool!.query(
+    `INSERT INTO users (name, email, password)
+     SELECT 'Pagination member', $1 || n::text || '@test.local', $2
+     FROM generate_series(1, 20) AS n RETURNING id`,
+    [prefix, passwordHash],
+  );
+  const memberIds: number[] = inserted.rows.map((row) => row.id);
+  userIds.push(...memberIds);
+  await pool!.query(
+    `INSERT INTO workspace_members (workspace_id, user_id, role)
+     SELECT $1, member_id, 'viewer' FROM unnest($2::int[]) AS member_id`,
+    [workspace.id, memberIds],
+  );
+
+  const membersUrl = `${baseUrl}/workspaces/${workspace.id}/members`;
+  const options = () => ({
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  const firstResponse = await fetch(membersUrl, options());
+  expect(firstResponse.status).toBe(200);
+  const first = await firstResponse.json();
+  expect(first.data).toHaveLength(20);
+  expect(first.page.nextCursor).toBe(first.data[19].userId);
+
+  const secondResponse = await fetch(
+    `${membersUrl}?afterUserId=${first.page.nextCursor}`, options(),
+  );
+  expect(secondResponse.status).toBe(200);
+  const second = await secondResponse.json();
+  expect(second.data).toHaveLength(1);
+  expect(second.page.nextCursor).toBeNull();
+  expect([...first.data, ...second.data].map((member) => member.userId))
+    .toEqual([userIds[0], ...memberIds].sort((a, b) => a - b));
+});
+
+test("a viewer can read the workspace member list", async () => {
+  const ownerToken = await login();
+  const created = await create({ name: "Viewer team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const viewer = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+  const viewerToken = await login(viewer.rows[0].email);
+
+  const response = await fetch(`${baseUrl}/workspaces/${workspace.id}/members`, {
+    headers: { authorization: `Bearer ${viewerToken}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    data: [
+      { userId: userIds[0], name: "Workspace owner fixture", role: "owner" },
+      { userId: userIds[1], name: "Workspace other fixture", role: "viewer" },
+    ],
+    page: { nextCursor: null },
+  });
+});
+
+test("rejects invalid member-list cursors", async () => {
+  const token = await login();
+  const created = await create({ name: "Cursor validation team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  for (const cursor of ["abc", "-1", "1.5", "2147483648"]) {
+    const response = await fetch(
+      `${baseUrl}/workspaces/${workspace.id}/members?afterUserId=${cursor}`,
+      {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "afterUserId" }),
+    ]));
   }
 });
 

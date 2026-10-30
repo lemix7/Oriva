@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import {
   createWorkspace,
   getWorkspace,
+  listWorkspaceMembers,
   listWorkspaces,
 } from "../services/workspaces.service.ts";
 import { AppError } from "../shared/app-error.ts";
@@ -78,4 +79,37 @@ export async function getWorkspaceController(req: Request, res: Response) {
   const workspace = await getWorkspace(wid, userId);
 
   return res.status(200).json({ data: workspace });
+}
+
+export async function listWorkspaceMembersController(
+  req: Request,
+  res: Response,
+) {
+  const userId =
+    req.user && typeof req.user !== "string"
+      ? req.user.userId
+      : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(
+      401,
+      "UNAUTHENTICATED",
+      "Authentication required",
+    );
+  }
+
+  const { wid } = res.locals.validatedParams;
+  const { afterUserId = 0 } = res.locals.validatedData;
+
+  const result = await listWorkspaceMembers(wid, userId, afterUserId);
+
+  return res.status(200).json({
+    data: result.data,
+    page: { nextCursor: result.nextCursor },
+  });
 }
