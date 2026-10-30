@@ -25,6 +25,8 @@ jest.unstable_mockModule("../repositories/workspace.repository.js", () => ({
   WORKSPACE_PAGE_SIZE: 20,
   getWorkspaceMembers: jest.fn(),
   MEMBER_PAGE_SIZE: 20,
+  lockWorkspace: jest.fn(),
+  updateWorkspaceMemberRole: jest.fn(),
 }));
 
 const { requireWorkspaceMembership, requireWorkspaceRole } = await import(
