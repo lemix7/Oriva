@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import type { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import dotenv from "dotenv";
+import loginRateLimit from "../../middleware/login-rate-limit.ts";
 
 // Keep the HTTP/auth/service/database flow real, without external delivery/storage.
 jest.unstable_mockModule("../../queue/email.que.js", () => ({
@@ -56,6 +57,8 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  // Each test has its own login allowance; keep the real login/auth flow.
+  loginRateLimit.resetKey("127.0.0.1");
   userIds = [];
   errorLog.mockClear();
   for (const name of ["Workspace owner fixture", "Workspace other fixture"]) {
@@ -160,6 +163,77 @@ test("creation trims the name and assigns ownership to the authenticated user", 
     "SELECT user_id, role FROM workspace_members WHERE workspace_id = $1", [body.data.id],
   );
   expect(memberships.rows).toEqual([{ user_id: userIds[0], role: "owner" }]);
+});
+
+test("a member can read their workspace", async () => {
+  const token = await login();
+  const created = await create({ name: "Team workspace" }, token);
+
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  const response = await fetch(
+    `${baseUrl}/workspaces/${workspace.id}`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: workspace });
+});
+
+test("a non-member cannot read another user's workspace", async () => {
+  const token = await login();
+
+  const result = await pool!.query(
+    "INSERT INTO workspaces (name, created_by) VALUES ($1, $2) RETURNING id",
+    ["Private workspace", userIds[1]],
+  );
+  const workspaceId = result.rows[0].id;
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+    [workspaceId, userIds[1], "owner"],
+  );
+
+  const response = await fetch(
+    `${baseUrl}/workspaces/${workspaceId}`,
+    {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace not found",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+});
+
+test("rejects invalid workspace IDs", async () => {
+  const token = await login();
+
+  for (const id of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    const response = await fetch(`${baseUrl}/workspaces/${id}`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    expect(response.status).toBe(422);
+
+    const body = await response.json();
+    expect(body.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: "wid" }),
+      ]),
+    );
+  }
 });
 
 test("lists only the authenticated user's workspaces", async () => {

@@ -2,7 +2,7 @@ import { type Request, type Response, type NextFunction } from "express";
 import type { VineValidator } from "@vinejs/vine";
 import type { MessagesProviderContact } from "@vinejs/vine/types";
 
-type ValidationSource = "body" | "query";
+type ValidationSource = "body" | "query" | "params";
 
 const validate = (
   validator: VineValidator<any, any>,

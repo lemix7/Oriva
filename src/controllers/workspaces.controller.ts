@@ -1,8 +1,10 @@
 import type { Request, Response } from "express";
 import {
   createWorkspace,
+  getWorkspace,
   listWorkspaces,
 } from "../services/workspaces.service.ts";
+import { AppError } from "../shared/app-error.ts";
 
 export async function createWorkspaceController(req: Request, res: Response) {
   const userId =
@@ -29,14 +31,9 @@ export async function createWorkspaceController(req: Request, res: Response) {
   return res.status(201).json({ data: workspace });
 }
 
-export async function listWorkspacesController(
-  req: Request,
-  res: Response,
-) {
+export async function listWorkspacesController(req: Request, res: Response) {
   const userId =
-    req.user && typeof req.user !== "string"
-      ? req.user.userId
-      : undefined;
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
 
   if (
     typeof userId !== "number" ||
@@ -62,4 +59,23 @@ export async function listWorkspacesController(
       nextCursor: result.nextCursor,
     },
   });
+}
+
+export async function getWorkspaceController(req: Request, res: Response) {
+  const userId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid } = res.locals.validatedData;
+  const workspace = await getWorkspace(wid, userId);
+
+  return res.status(200).json({ data: workspace });
 }
