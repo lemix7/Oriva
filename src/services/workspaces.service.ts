@@ -6,6 +6,8 @@ import {
   WORKSPACE_PAGE_SIZE,
   getWorkspaceMembership,
   getWorkspaceById,
+  MEMBER_PAGE_SIZE,
+  getWorkspaceMembers,
 } from "../repositories/workspace.repository.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -73,4 +75,21 @@ export async function getWorkspace(workspaceId: number, userId: number) {
   }
 
   return workspace;
+}
+
+export async function listWorkspaceMembers(
+  workspaceId: number,
+  userId: number,
+  afterUserId = 0,
+) {
+  await requireWorkspaceMembership(workspaceId, userId);
+
+  const results = await getWorkspaceMembers(workspaceId, afterUserId);
+  const hasNextPage = results.length > MEMBER_PAGE_SIZE;
+  const data = results.slice(0, MEMBER_PAGE_SIZE);
+
+  return {
+    data,
+    nextCursor: hasNextPage ? data[data.length - 1].userId : null,
+  };
 }
