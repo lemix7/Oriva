@@ -1,8 +1,8 @@
 import { beforeEach, expect, jest, test } from "@jest/globals";
 import { AppError } from "../shared/app-error.ts";
-import { getWorkspaceById } from "../repositories/workspace.repository.ts";
 
 type Repository = typeof import("../repositories/workspace.repository.ts");
+const getWorkspaceById = jest.fn<Repository["getWorkspaceById"]>();
 type Membership = NonNullable<Awaited<ReturnType<Repository["getWorkspaceMembership"]>>>;
 // SQL may return no row, even though this project's TS settings infer a row.
 const getWorkspaceMembership = jest.fn<
@@ -27,6 +27,7 @@ const { requireWorkspaceMembership, requireWorkspaceRole } =
 
 beforeEach(() => {
   getWorkspaceMembership.mockReset();
+  getWorkspaceById.mockReset();
 });
 
 function membership(role: Membership["role"]): Membership {
