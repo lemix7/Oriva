@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import {
+  changeWorkspaceMemberRole,
   createWorkspace,
   getWorkspace,
   listWorkspaceMembers,
@@ -86,9 +87,7 @@ export async function listWorkspaceMembersController(
   res: Response,
 ) {
   const userId =
-    req.user && typeof req.user !== "string"
-      ? req.user.userId
-      : undefined;
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
 
   if (
     typeof userId !== "number" ||
@@ -96,11 +95,7 @@ export async function listWorkspaceMembersController(
     userId <= 0 ||
     userId > 2147483647
   ) {
-    throw new AppError(
-      401,
-      "UNAUTHENTICATED",
-      "Authentication required",
-    );
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
   }
 
   const { wid } = res.locals.validatedParams;
@@ -112,4 +107,28 @@ export async function listWorkspaceMembersController(
     data: result.data,
     page: { nextCursor: result.nextCursor },
   });
+}
+
+export async function changeWorkspaceMemberRoleController(
+  req: Request,
+  res: Response,
+) {
+  const actorId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, uid } = res.locals.validatedParams;
+  const { role } = res.locals.validatedData;
+
+  const member = await changeWorkspaceMemberRole(wid, actorId, uid, role);
+
+  return res.status(200).json({ data: member });
 }

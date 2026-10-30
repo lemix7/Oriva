@@ -146,6 +146,23 @@ async function expectNoWorkspace() {
   expect(result.rows[0].count).toBe(0);
 }
 
+async function changeRole(workspaceId: number | string, memberId: number | string, role: unknown, token: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/members/${memberId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ role }),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function membershipSnapshot(workspaceId: number) {
+  const result = await pool!.query(
+    "SELECT user_id, role, updated_at FROM workspace_members WHERE workspace_id = $1 ORDER BY user_id",
+    [workspaceId],
+  );
+  return result.rows;
+}
+
 test("creation trims the name and assigns ownership to the authenticated user", async () => {
   const token = await login();
   const response = await create({
@@ -394,6 +411,277 @@ test("rejects invalid member-list cursors", async () => {
     expect(body.errors).toEqual(expect.arrayContaining([
       expect.objectContaining({ field: "afterUserId" }),
     ]));
+  }
+});
+
+test("the owner can change a viewer to an editor and persist the role", async () => {
+  const token = await login();
+  const created = await create({ name: "Role change team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+
+  const response = await fetch(
+    `${baseUrl}/workspaces/${workspace.id}/members/${userIds[1]}`,
+    {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ role: "editor" }),
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    data: { workspaceId: workspace.id, userId: userIds[1], role: "editor" },
+  });
+
+  const saved = await pool!.query(
+    "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    [workspace.id, userIds[1]],
+  );
+  expect(saved.rows).toEqual([{ role: "editor" }]);
+});
+
+test.each(["editor", "viewer"] as const)(
+  "a %s cannot change member roles",
+  async (role) => {
+    const ownerToken = await login();
+    const created = await create({ name: "Protected team" }, ownerToken);
+    expect(created.status).toBe(201);
+    const { data: workspace } = await created.json();
+    await pool!.query(
+      "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+      [workspace.id, userIds[1], role],
+    );
+    const other = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+    const token = await login(other.rows[0].email);
+    const before = await membershipSnapshot(workspace.id);
+
+    const response = await changeRole(
+      workspace.id, userIds[1], role === "editor" ? "viewer" : "editor", token,
+    );
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "FORBIDDEN",
+        message: "Only owners can change member roles",
+        requestId: response.headers.get("x-request-id"),
+      },
+    });
+    expect(await membershipSnapshot(workspace.id)).toEqual(before);
+  },
+);
+
+test("a non-member cannot change workspace roles", async () => {
+  const ownerToken = await login();
+  const created = await create({ name: "Private role team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  const other = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+  const token = await login(other.rows[0].email);
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await changeRole(workspace.id, userIds[0], "viewer", token);
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace not found",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("the owner cannot demote themselves through a role change", async () => {
+  const token = await login();
+  const created = await create({ name: "Owner protection team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await changeRole(workspace.id, userIds[0], "viewer", token);
+
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "OWNERSHIP_TRANSFER_REQUIRED",
+      message: "Use ownership transfer to change the owner",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("the role endpoint rejects assigning owner", async () => {
+  const token = await login();
+  const created = await create({ name: "Ownership validation team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await changeRole(workspace.id, userIds[1], "owner", token);
+
+  expect(response.status).toBe(422);
+  const body = await response.json();
+  expect(body.errors).toEqual(expect.arrayContaining([
+    expect.objectContaining({ field: "role" }),
+  ]));
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("the owner can change an editor back to viewer", async () => {
+  const token = await login();
+  const created = await create({ name: "Editor demotion team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'editor')",
+    [workspace.id, userIds[1]],
+  );
+
+  const response = await changeRole(workspace.id, userIds[1], "viewer", token);
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    data: { workspaceId: workspace.id, userId: userIds[1], role: "viewer" },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual([
+    expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+    expect.objectContaining({ user_id: userIds[1], role: "viewer" }),
+  ]);
+});
+
+test("changing a user outside the workspace returns 404", async () => {
+  const token = await login();
+  const created = await create({ name: "Missing member team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await changeRole(workspace.id, userIds[1], "editor", token);
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace member not found",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("role changes reject invalid IDs and invalid or missing roles", async () => {
+  const token = await login();
+  const created = await create({ name: "Role validation team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspace.id);
+
+  for (const invalidId of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "uid"]) {
+      const response = await changeRole(
+        field === "wid" ? invalidId : workspace.id,
+        field === "uid" ? invalidId : userIds[1],
+        "editor", token,
+      );
+      expect(response.status).toBe(422);
+      const body = await response.json();
+      expect(body.errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+
+  // Undefined serializes to an empty body object, exercising the required rule.
+  for (const role of ["admin", "", null, 123, undefined]) {
+    const response = await changeRole(workspace.id, userIds[1], role, token);
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    expect(body.errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "role" }),
+    ]));
+  }
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("role changes wait for the workspace lock before updating", async () => {
+  const token = await login();
+  const created = await create({ name: "Locked role team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspace.id);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspace.id]);
+    pending = changeRole(workspace.id, userIds[1], "editor", token);
+    // Attach an immediate rejection handler while observing the database wait.
+    void pending.catch(() => {});
+
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND $1::int = ANY(pg_blocking_pids(pid))
+             AND query ILIKE '%workspaces%'
+         ) AS blocked`,
+        [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) {
+        blocked = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    expect(blocked).toBe(true);
+    expect(await membershipSnapshot(workspace.id)).toEqual(before);
+    await locker.query("COMMIT");
+
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      data: { workspaceId: workspace.id, userId: userIds[1], role: "editor" },
+    });
+    expect(await membershipSnapshot(workspace.id)).toEqual([
+      expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+      expect.objectContaining({ user_id: userIds[1], role: "editor" }),
+    ]);
+  } finally {
+    // Release the lock even on assertion failure before fixture cleanup runs.
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) {
+      await pending.then((response) => response.text()).catch(() => {});
+    }
   }
 });
 

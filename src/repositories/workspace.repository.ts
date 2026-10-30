@@ -1,6 +1,6 @@
 import { workspaces, workspaceMembers, users } from "../db/schema.ts";
 import { db } from "../db/index.ts";
-import { and, asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt, ne } from "drizzle-orm";
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -31,10 +31,7 @@ export async function insertOwnerMembership(
 
 export const WORKSPACE_PAGE_SIZE = 20;
 
-export async function getWorkspacesByUserId(
-  userId: number,
-  afterId = 0,
-) {
+export async function getWorkspacesByUserId(userId: number, afterId = 0) {
   return db
     .select({
       id: workspaces.id,
@@ -42,14 +39,8 @@ export async function getWorkspacesByUserId(
       role: workspaceMembers.role,
     })
     .from(workspaceMembers)
-    .innerJoin(
-      workspaces,
-      eq(workspaceMembers.workspaceId, workspaces.id),
-    )
-    .where(and(
-      eq(workspaceMembers.userId, userId),
-      gt(workspaces.id, afterId),
-    ))
+    .innerJoin(workspaces, eq(workspaceMembers.workspaceId, workspaces.id))
+    .where(and(eq(workspaceMembers.userId, userId), gt(workspaces.id, afterId)))
     .orderBy(asc(workspaces.id))
     .limit(WORKSPACE_PAGE_SIZE + 1);
 }
@@ -57,7 +48,9 @@ export async function getWorkspacesByUserId(
 export async function getWorkspaceMembership(
   workspaceId: number,
   userId: number,
+  tx?: Transaction,
 ) {
+  const query = tx ?? db;
   const [membership] = await db
     .select({
       workspaceId: workspaceMembers.workspaceId,
@@ -108,4 +101,42 @@ export async function getWorkspaceMembers(
     )
     .orderBy(asc(workspaceMembers.userId))
     .limit(MEMBER_PAGE_SIZE + 1);
-} 
+}
+
+export async function lockWorkspace(tx: Transaction, workspaceId: number) {
+  const [workspace] = await tx
+    .select({ id: workspaces.id })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId))
+    .for("update");
+
+  return workspace;
+}
+
+export async function updateWorkspaceMemberRole(
+  tx: Transaction,
+  workspaceId: number,
+  userId: number,
+  role: "editor" | "viewer",
+) {
+  const [member] = await tx
+    .update(workspaceMembers)
+    .set({
+      role,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+        ne(workspaceMembers.role, "owner"),
+      ),
+    )
+    .returning({
+      workspaceId: workspaceMembers.workspaceId,
+      userId: workspaceMembers.userId,
+      role: workspaceMembers.role,
+    });
+
+  return member;
+}
