@@ -2,6 +2,7 @@ import { afterAll, beforeEach, expect, jest, test } from "@jest/globals";
 import type { Request, Response } from "express";
 import { errors } from "@vinejs/vine";
 import errorHandling from "../middleware/error-handling.ts";
+import { AppError } from "../shared/app-error.ts";
 
 const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
 beforeEach(() => { errorLog.mockClear(); });
@@ -15,6 +16,28 @@ function response() {
     json: jest.fn().mockReturnThis(),
   };
 }
+
+test.each([
+  { status: 404, code: "NOT_FOUND", message: "Workspace not found" },
+  { status: 403, code: "FORBIDDEN", message: "Permission denied" },
+])("returns $status for an application error", ({ status, code, message }) => {
+  const res = response();
+  const next = jest.fn();
+
+  errorHandling(
+    new AppError(status, code, message),
+    {} as Request,
+    res as unknown as Response,
+    next,
+  );
+
+  expect(res.status).toHaveBeenCalledWith(status);
+  expect(res.json).toHaveBeenCalledWith({
+    error: { code, message, requestId: "test-request-id" },
+  });
+  expect(errorLog).not.toHaveBeenCalled();
+  expect(next).not.toHaveBeenCalled();
+});
 
 test("unexpected errors include the request ID and log only safe structured fields", () => {
   const res = response();

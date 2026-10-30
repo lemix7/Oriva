@@ -53,3 +53,35 @@ export async function getWorkspacesByUserId(
     .orderBy(asc(workspaces.id))
     .limit(WORKSPACE_PAGE_SIZE + 1);
 }
+
+export async function getWorkspaceMembership(
+  workspaceId: number,
+  userId: number,
+) {
+  const [membership] = await db
+    .select({
+      workspaceId: workspaceMembers.workspaceId,
+      userId: workspaceMembers.userId,
+      role: workspaceMembers.role,
+    })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+      ),
+    )
+    .limit(1);
+
+  return membership;
+}
+
+export async function getWorkspaceById(workspaceId: number) {
+  const [workspace] = await db
+    .select()
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId))
+    .limit(1);
+
+  return workspace;
+}

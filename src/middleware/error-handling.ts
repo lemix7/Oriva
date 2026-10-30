@@ -1,16 +1,7 @@
 import { type Request, type Response, type NextFunction } from "express";
 import { errors } from "@vinejs/vine";
 import { MulterError } from "multer";
-
-class AppError extends Error {
-  public statusCode: number;
-
-  constructor(statusCode: number, message: string) {
-    super(message);
-    this.name = "AppError";
-    this.statusCode = statusCode;
-  }
-}
+import { AppError } from "../shared/app-error.ts";
 
 const errorHandling = function (
   err: Error,
@@ -23,6 +14,16 @@ const errorHandling = function (
   }
 
   const requestId = res.locals.requestId;
+
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({
+      error: {
+        code: err.code,
+        message: err.message,
+        requestId,
+      },
+    });
+  }
 
   if (err instanceof MulterError && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({
