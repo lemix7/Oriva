@@ -22,6 +22,7 @@ import parseProfile from "./middleware/parse-profile.ts";
 import requestId from "./middleware/request-id.ts";
 import loginRateLimit from "./middleware/login-rate-limit.ts";
 import workspaceRouter from "./routes/workspaces.routes.ts";
+import invitationRouter from "./routes/invitations.routes.ts";
 
 const app: Express = express();
 
@@ -53,6 +54,7 @@ app.get("/error", (req: Request, res: Response) => {
 app.use(authenticateJWT);
 
 // Protected endpoints
+app.use("/invitations", invitationRouter);
 app.use("/workspaces", workspaceRouter);
 app.use("/users/projects", projectRouter);
 app.use("/projects", taskRouter);

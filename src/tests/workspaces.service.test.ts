@@ -32,6 +32,11 @@ jest.unstable_mockModule("../repositories/workspace.repository.js", () => ({
   promoteWorkspaceOwner: jest.fn(),
 }));
 
+jest.unstable_mockModule("../repositories/invitations.repository.js", () => ({
+  getInvitationRecipient: jest.fn(),
+  revokePendingInvitations: jest.fn(),
+}));
+
 const { requireWorkspaceMembership, requireWorkspaceRole } = await import(
   "../services/workspaces.service.ts"
 );

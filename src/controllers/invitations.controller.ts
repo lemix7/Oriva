@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import { createWorkspaceInvitation } from "../services/invitations.service.ts";
+import { acceptWorkspaceInvitation, createWorkspaceInvitation } from "../services/invitations.service.ts";
 import { queueInvitationEmail } from "../services/invitation-delivery.service.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -46,4 +46,31 @@ export async function createInvitationController(
   }
 
   return res.status(201).json({ data: invitation });
+}
+export async function acceptInvitationController(
+  req: Request,
+  res: Response,
+) {
+  const userId =
+    req.user && typeof req.user !== "string"
+      ? req.user.userId
+      : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(
+      401,
+      "UNAUTHENTICATED",
+      "Authentication required",
+    );
+  }
+
+  const { token } = res.locals.validatedData;
+  const membership = await acceptWorkspaceInvitation(token, userId);
+
+  return res.status(201).json({ data: membership });
 }

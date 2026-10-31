@@ -15,6 +15,10 @@ import {
   demoteWorkspaceOwner,
 } from "../repositories/workspace.repository.ts";
 import { AppError } from "../shared/app-error.ts";
+import {
+  getInvitationRecipient,
+  revokePendingInvitations,
+} from "../repositories/invitations.repository.ts";
 
 export async function createWorkspace(name: string, userId: number) {
   return db.transaction(async (tx) => {
@@ -172,6 +176,12 @@ export async function removeWorkspaceMember(
         "OWNERSHIP_TRANSFER_REQUIRED",
         "Transfer ownership before removing the owner",
       );
+    }
+
+    const user = await getInvitationRecipient(tx, memberId);
+
+    if (user?.email) {
+      await revokePendingInvitations(tx, workspaceId, user.email);
     }
 
     const removed = await deleteWorkspaceMember(tx, workspaceId, memberId);
