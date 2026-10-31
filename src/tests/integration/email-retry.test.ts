@@ -8,6 +8,7 @@ import type { Queue, QueueEvents, Worker } from "bullmq";
 
 const send = jest.fn<(...args: unknown[]) => Promise<unknown>>();
 const originalApiKey = process.env.RESEND_API_KEY;
+const originalEmailFrom = process.env.EMAIL_FROM;
 let directory: string | undefined;
 let redisProcess: ChildProcess | undefined;
 let queue: Queue | undefined;
@@ -23,6 +24,7 @@ jest.unstable_mockModule("dotenv", () => ({ default: { config: jest.fn() } }));
 
 beforeAll(async () => {
   process.env.RESEND_API_KEY = "integration-test-resend-key";
+  process.env.EMAIL_FROM = "Oriva <invite@test.local>";
   // A fresh socket-only Redis process ensures tests cannot reach application
   // queues or send real email. It never listens on a network port or saves data.
   directory = await mkdtemp(join(tmpdir(), "oriva-email-"));
@@ -70,6 +72,8 @@ afterAll(async () => {
   } finally {
     if (originalApiKey === undefined) delete process.env.RESEND_API_KEY;
     else process.env.RESEND_API_KEY = originalApiKey;
+    if (originalEmailFrom === undefined) delete process.env.EMAIL_FROM;
+    else process.env.EMAIL_FROM = originalEmailFrom;
     logs?.mockRestore();
     errors?.mockRestore();
     if (redisProcess && redisProcess.exitCode === null && redisProcess.signalCode === null) {
@@ -89,6 +93,40 @@ const temporaryFailure = {
 function keysUsed() {
   return send.mock.calls.map((call) => (call[1] as { idempotencyKey: string }).idempotencyKey);
 }
+
+test("invitation jobs recover with one key, route to the recipient, and remove completed secrets", async () => {
+  send.mockResolvedValueOnce(temporaryFailure)
+    .mockResolvedValue({ data: { id: "invitation-delivered" }, error: null });
+  const { queueInvitationEmail } = await import("../../services/invitation-delivery.service.ts");
+  await queueInvitationEmail(701, "sara@test.local", "test-only-invitation-token");
+  const job = await queue!.getJob("invitation-701");
+  expect(job).toBeDefined();
+  expect(job!.opts).toMatchObject({
+    attempts: 3, removeOnComplete: true, removeOnFail: { age: 86400 },
+  });
+  await job!.waitUntilFinished(events!, 10000);
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(keysUsed()).toEqual(Array(2).fill(
+    `sendInvitationEmail/emailQueue/${job!.id}/${job!.timestamp}`,
+  ));
+  expect(send.mock.calls[0]![0]).toMatchObject({
+    to: "sara@test.local", text: expect.stringContaining("test-only-invitation-token"),
+  });
+  expect(await queue!.getJob(job!.id!)).toBeUndefined();
+  expect(JSON.stringify(logs!.mock.calls)).not.toContain("test-only-invitation-token");
+});
+
+test("invitation permanent failures stop after one worker attempt", async () => {
+  send.mockResolvedValue({ data: null, error: {
+    name: "validation_error", statusCode: 422, message: "Invalid recipient",
+  } });
+  const job = await queue!.add("sendInvitationEmail", {
+    email: "sara@test.local", token: "test-only-invitation-token",
+  });
+  await expect(job.waitUntilFinished(events!, 10000)).rejects.toThrow("Invalid recipient");
+  expect(send).toHaveBeenCalledTimes(1);
+  expect((await queue!.getJob(job.id!))!.attemptsMade).toBe(1);
+});
 
 test("temporary failures use three attempts, exponential delays, and one idempotency key", async () => {
   const times: number[] = [];

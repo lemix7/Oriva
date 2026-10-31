@@ -131,3 +131,42 @@ export const workspaceMembers = pgTable(
     index("workspace_members_user_idx").on(table.userId),
   ],
 );
+
+export const invitations = pgTable(
+  "invitations",
+  {
+    id: serial().primaryKey(),
+    workspaceId: integer("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    email: varchar({ length: 254 }).notNull(),
+    role: varchar({
+      length: 10,
+      enum: ["editor", "viewer"],
+    }).notNull(),
+    tokenHash: varchar("token_hash", { length: 64 })
+      .notNull()
+      .unique(),
+    expiresAt: timestamp("expires_at", { withTimezone: true })
+      .notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    invitedBy: integer("invited_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    check(
+      "invitations_role_check",
+      sql`${table.role} IN ('editor', 'viewer')`,
+    ),
+    index("invitations_workspace_idx").on(table.workspaceId),
+    index("invitations_invited_by_idx").on(table.invitedBy),
+  ],
+);

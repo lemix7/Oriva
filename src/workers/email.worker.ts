@@ -1,32 +1,34 @@
 import { Worker } from "bullmq";
 import connection from "../config/redis.ts";
-import newUserEmail from "../services/email.service.ts";
+import newUserEmail, {
+  sendInvitationEmail,
+} from "../services/email.service.ts";
 
 const emailWworker = new Worker(
   "emailQueue",
   async (job) => {
-    try {
-      const { user_name } = job.data;
-      console.log(
-        `Sending email to ahmedgeger@gmail.com about the joing of ${user_name}`,
+    if (!job.id) {
+      throw new Error("Email job ID is missing");
+    }
+
+    const idempotencyKey = `${job.name}/${job.queueName}/${job.id}/${job.timestamp}`;
+
+    if (job.name === "sendInvitationEmail") {
+      return sendInvitationEmail(
+        job.data.email,
+        job.data.token,
+        idempotencyKey,
       );
+    }
 
-      if (!job.id) {
-        throw new Error("Email job ID is missing");
-      }
-
-      const result = await newUserEmail(
-        user_name,
+    if (job.name === "sendEmail") {
+      return newUserEmail(
+        job.data.user_name,
         `registration/${job.queueName}/${job.id}/${job.timestamp}`,
       );
-
-      if (!result) {
-        throw new Error("Email delivery failed");
-      }
-    } catch (error) {
-      console.error(`Failed to send email about ${job.data.user_name}`);
-      throw error instanceof Error ? error : new Error("Email job failed");
     }
+
+    throw new Error("Unknown email job type");
   },
   { connection },
 );

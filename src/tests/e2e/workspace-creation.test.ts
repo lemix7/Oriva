@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, jest, test } from "@jest/globals";
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Pool } from "pg";
@@ -9,8 +9,9 @@ import dotenv from "dotenv";
 import loginRateLimit from "../../middleware/login-rate-limit.ts";
 
 // Keep the HTTP/auth/service/database flow real, without external delivery/storage.
+const queueEmail = jest.fn<(...args: unknown[]) => Promise<unknown>>();
 jest.unstable_mockModule("../../queue/email.que.js", () => ({
-  default: { add: jest.fn() },
+  default: { add: queueEmail },
 }));
 jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => ({
   uploadProfilePicture: jest.fn(),
@@ -57,6 +58,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  queueEmail.mockReset().mockResolvedValue(undefined);
   // Each test has its own login allowance; keep the real login/auth flow.
   loginRateLimit.resetKey("127.0.0.1");
   userIds = [];
@@ -1118,6 +1120,199 @@ test("a waiting transfer rechecks owner authority after the workspace lock is re
     try { await locker.query("ROLLBACK"); } finally { locker.release(); }
     if (pending) await pending.then((response) => response.text()).catch(() => {});
   }
+});
+
+async function invite(workspaceId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/invitations`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function savedInvitations(workspaceId: number) {
+  const result = await pool!.query(
+    "SELECT * FROM invitations WHERE workspace_id = $1 ORDER BY id", [workspaceId],
+  );
+  return result.rows;
+}
+
+test.each(["editor", "viewer"])(
+  "the owner can invite an %s with a hashed token and safe response",
+  async (role) => {
+    const { workspaceId, ownerToken } = await ownershipFixture();
+    // Observe the insert from another connection to prove it committed before enqueue.
+    queueEmail.mockImplementation(async (_name, payload) => {
+      const job = payload as { invitationId: number };
+      const committed = await pool!.query("SELECT id FROM invitations WHERE id = $1", [job.invitationId]);
+      expect(committed.rows).toEqual([{ id: job.invitationId }]);
+    });
+    const start = Date.now();
+    const response = await invite(workspaceId, {
+      email: "  Sara@Example.com  ", role,
+      invitedBy: userIds[1], workspaceId: -1,
+      tokenHash: "caller-controlled", expiresAt: "2099-01-01",
+    }, ownerToken);
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    const [saved] = await savedInvitations(workspaceId);
+    expect(body).toEqual({ data: {
+      id: saved.id, workspaceId, email: "sara@example.com", role,
+      expiresAt: saved.expires_at.toISOString(), invitedBy: userIds[0],
+      createdAt: saved.created_at.toISOString(),
+    } });
+    expect(saved.accepted_at).toBeNull();
+    expect(saved.revoked_at).toBeNull();
+    const lifetime = 7 * 24 * 60 * 60 * 1000;
+    expect(saved.expires_at.getTime()).toBeGreaterThanOrEqual(start + lifetime);
+    expect(saved.expires_at.getTime()).toBeLessThanOrEqual(Date.now() + lifetime);
+    expect(queueEmail).toHaveBeenCalledTimes(1);
+    const [name, payload, options] = queueEmail.mock.calls[0]!;
+    const job = payload as { invitationId: number; email: string; token: string };
+    expect(name).toBe("sendInvitationEmail");
+    expect(job).toEqual({ invitationId: saved.id, email: "sara@example.com", token: expect.any(String) });
+    expect(job.token).toMatch(/^[a-f0-9]{64}$/);
+    expect(saved.token_hash).toBe(createHash("sha256").update(job.token).digest("hex"));
+    expect(saved.token_hash).not.toBe(job.token);
+    expect(options).toEqual({
+      jobId: `invitation-${saved.id}`, removeOnComplete: true,
+      removeOnFail: { age: 86400 },
+    });
+    expect(JSON.stringify(body)).not.toContain(job.token);
+    expect(JSON.stringify(body)).not.toContain(saved.token_hash);
+    expect(JSON.stringify(requestLog.mock.calls)).not.toContain(job.token);
+    expect(JSON.stringify(errorLog.mock.calls)).not.toContain(job.token);
+  },
+);
+
+test.each(["editor", "viewer", "outsider"] as const)(
+  "an %s cannot issue invitations",
+  async (role) => {
+    const { workspaceId, otherToken } = await ownershipFixture(role);
+    const response = await invite(workspaceId, { email: "sara@example.com", role: "editor" }, otherToken);
+    expect(response.status).toBe(role === "outsider" ? 404 : 403);
+    expect((await response.json()).error.code).toBe(role === "outsider" ? "NOT_FOUND" : "FORBIDDEN");
+    expect(await savedInvitations(workspaceId)).toEqual([]);
+    expect(queueEmail).not.toHaveBeenCalled();
+  },
+);
+
+test("invitation creation requires authentication before validation", async () => {
+  const { workspaceId } = await ownershipFixture();
+  const response = await invite(workspaceId, {});
+  expect(response.status).toBe(401);
+  await response.text();
+  expect(await savedInvitations(workspaceId)).toEqual([]);
+  expect(queueEmail).not.toHaveBeenCalled();
+});
+
+test("invitation creation rejects invalid fields and workspace IDs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const invalidId of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    const response = await invite(invalidId, { email: "sara@example.com", role: "editor" }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "wid" }),
+    ]));
+  }
+  for (const email of [undefined, null, "", "not-an-email", 42, `${"a".repeat(250)}@example.com`]) {
+    const response = await invite(workspaceId, { email, role: "editor" }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "email" }),
+    ]));
+  }
+  for (const role of [undefined, null, "", "owner", "admin", 42]) {
+    const response = await invite(workspaceId, { email: "sara@example.com", role }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "role" }),
+    ]));
+  }
+  expect(await savedInvitations(workspaceId)).toEqual([]);
+  expect(queueEmail).not.toHaveBeenCalled();
+});
+
+test("a missing invitation workspace returns 404 without queueing", async () => {
+  const token = await login();
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  const response = await invite(2147483647, { email: "sara@example.com", role: "viewer" }, token);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+  expect(queueEmail).not.toHaveBeenCalled();
+});
+
+test("queue failure reports 503 and preserves the committed invitation", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  queueEmail.mockRejectedValueOnce(new Error("Queue unavailable"));
+  const response = await invite(workspaceId, { email: "sara@example.com", role: "viewer" }, ownerToken);
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: {
+    code: "INVITATION_EMAIL_QUEUE_FAILED",
+    message: "Invitation was saved, but its email could not be queued",
+    requestId: response.headers.get("x-request-id"),
+  } });
+  const rows = await savedInvitations(workspaceId);
+  expect(rows).toHaveLength(1);
+  expect(rows[0].token_hash).toMatch(/^[a-f0-9]{64}$/);
+  expect(queueEmail).toHaveBeenCalledTimes(1);
+});
+
+test("a failed invitation insert cannot enqueue an email", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const constraint = `invitation_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(
+      `ALTER TABLE invitations ADD CONSTRAINT ${constraint} CHECK (workspace_id <> ${workspaceId}) NOT VALID`,
+    );
+    const response = await invite(workspaceId, { email: "sara@example.com", role: "viewer" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedInvitations(workspaceId)).toEqual([]);
+    expect(queueEmail).not.toHaveBeenCalled();
+  } finally {
+    await pool!.query(`ALTER TABLE invitations DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test("invitation token hashes are unique and invalid roles are rejected by PostgreSQL", async () => {
+  const { workspaceId } = await ownershipFixture();
+  const tokenHash = createHash("sha256").update(randomUUID()).digest("hex");
+  const sql = `INSERT INTO invitations (workspace_id, email, role, token_hash, expires_at, invited_by)
+    VALUES ($1, 'sara@example.com', $2, $3, now() + interval '7 days', $4)`;
+  await pool!.query(sql, [workspaceId, "viewer", tokenHash, userIds[0]]);
+  await expect(pool!.query(sql, [workspaceId, "editor", tokenHash, userIds[0]]))
+    .rejects.toMatchObject({ code: "23505" });
+  await expect(pool!.query(sql, [workspaceId, "owner", "b".repeat(64), userIds[0]]))
+    .rejects.toMatchObject({ code: "23514" });
+  expect(await savedInvitations(workspaceId)).toHaveLength(1);
+});
+
+test("workspace deletion cascades to its invitations", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const response = await invite(workspaceId, { email: "sara@example.com", role: "viewer" }, ownerToken);
+  expect(response.status).toBe(201);
+  await response.json();
+  await pool!.query("DELETE FROM workspaces WHERE id = $1", [workspaceId]);
+  expect(await savedInvitations(workspaceId)).toEqual([]);
+});
+
+test("sender deletion cascades to invitations they issued", async () => {
+  const { workspaceId } = await ownershipFixture("outsider");
+  // A sender may have already left after issuing an invitation.
+  await pool!.query(
+    `INSERT INTO invitations (workspace_id, email, role, token_hash, expires_at, invited_by)
+     VALUES ($1, 'sara@example.com', 'viewer', $2, now() + interval '7 days', $3)`,
+    [workspaceId, createHash("sha256").update(randomUUID()).digest("hex"), userIds[1]],
+  );
+  await pool!.query("DELETE FROM users WHERE id = $1", [userIds[1]]);
+  expect(await savedInvitations(workspaceId)).toEqual([]);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = $1", [workspaceId])).rows)
+    .toEqual([{ id: workspaceId }]);
 });
 
 test("lists only the authenticated user's workspaces", async () => {
