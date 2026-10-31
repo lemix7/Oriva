@@ -897,6 +897,229 @@ test("member removal waits for the workspace lock", async () => {
   }
 });
 
+async function transferOwnership(workspaceId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/ownership-transfer`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function ownershipFixture(role: "editor" | "viewer" | "outsider" = "viewer") {
+  const ownerToken = await login();
+  const created = await create({ name: "Ownership transfer team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  if (role !== "outsider") {
+    await pool!.query(
+      "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+      [workspace.id, userIds[1], role],
+    );
+  }
+  const account = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+  const otherToken = await login(account.rows[0].email);
+  return { workspaceId: workspace.id as number, ownerToken, otherToken };
+}
+
+test.each(["editor", "viewer"] as const)(
+  "ownership can transfer to an existing %s, preserving creator attribution",
+  async (role) => {
+    const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+    const response = await transferOwnership(workspaceId, {
+      newOwnerId: userIds[1], actorId: userIds[1], role: "viewer",
+    }, ownerToken);
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      data: {
+        formerOwner: { workspaceId, userId: userIds[0], role: "editor" },
+        newOwner: { workspaceId, userId: userIds[1], role: "owner" },
+      },
+    });
+    expect(await membershipSnapshot(workspaceId)).toEqual([
+      expect.objectContaining({ user_id: userIds[0], role: "editor" }),
+      expect.objectContaining({ user_id: userIds[1], role: "owner" }),
+    ]);
+    const creator = await pool!.query("SELECT created_by FROM workspaces WHERE id = $1", [workspaceId]);
+    expect(creator.rows).toEqual([{ created_by: userIds[0] }]);
+
+    // Previously issued tokens must use current membership roles.
+    const denied = await changeRole(workspaceId, userIds[1], "viewer", ownerToken);
+    expect(denied.status).toBe(403);
+    await denied.json();
+    const allowed = await changeRole(workspaceId, userIds[0], "viewer", otherToken);
+    expect(allowed.status).toBe(200);
+    await allowed.json();
+  },
+);
+
+test.each(["editor", "viewer", "outsider"] as const)(
+  "a %s cannot transfer ownership",
+  async (role) => {
+    const { workspaceId, otherToken } = await ownershipFixture(role);
+    const before = await membershipSnapshot(workspaceId);
+    const response = await transferOwnership(workspaceId, { newOwnerId: userIds[0] }, otherToken);
+    expect(response.status).toBe(role === "outsider" ? 404 : 403);
+    const body = await response.json();
+    expect(body.error.code).toBe(role === "outsider" ? "NOT_FOUND" : "FORBIDDEN");
+    expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  },
+);
+
+test("ownership transfer requires authentication before body validation", async () => {
+  const { workspaceId } = await ownershipFixture();
+  const before = await membershipSnapshot(workspaceId);
+  const response = await transferOwnership(workspaceId, {});
+  expect(response.status).toBe(401);
+  await response.text();
+  expect(await membershipSnapshot(workspaceId)).toEqual(before);
+});
+
+test("the owner cannot transfer ownership to themselves", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const before = await membershipSnapshot(workspaceId);
+  const response = await transferOwnership(workspaceId, { newOwnerId: userIds[0] }, ownerToken);
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "ALREADY_OWNER", message: "You already own this workspace",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspaceId)).toEqual(before);
+});
+
+test("a member of another workspace cannot be made owner without membership", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const otherWorkspace = await create({ name: "Separate team" }, otherToken);
+  expect(otherWorkspace.status).toBe(201);
+  const { data: other } = await otherWorkspace.json();
+  const before = await membershipSnapshot(workspaceId);
+  const otherBefore = await membershipSnapshot(other.id);
+
+  const response = await transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken);
+  expect(response.status).toBe(404);
+  const body = await response.json();
+  expect(body.error.message).toBe("Workspace member not found");
+  expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  expect(await membershipSnapshot(other.id)).toEqual(otherBefore);
+});
+
+test("ownership transfer to a missing workspace returns 404", async () => {
+  const token = await login();
+  const missing = await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647");
+  expect(missing.rows).toEqual([]);
+  const response = await transferOwnership(2147483647, { newOwnerId: userIds[1] }, token);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("ownership transfer rejects invalid IDs and missing or invalid target IDs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const before = await membershipSnapshot(workspaceId);
+  for (const invalid of ["abc", 0, -1, 1.5, 2147483648]) {
+    const response = await transferOwnership(String(invalid), { newOwnerId: userIds[1] }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "wid" }),
+    ]));
+  }
+  for (const invalid of [undefined, null, "abc", 0, -1, 1.5, 2147483648, {}, []]) {
+    const response = await transferOwnership(workspaceId, { newOwnerId: invalid }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "newOwnerId" }),
+    ]));
+  }
+  expect(await membershipSnapshot(workspaceId)).toEqual(before);
+});
+
+test("a failed promotion rolls back the former owner's demotion", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const before = await membershipSnapshot(workspaceId);
+  const constraint = `transfer_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    // Only prevent this fixture member from becoming owner, without invalidating other rows.
+    await pool!.query(
+      `ALTER TABLE workspace_members ADD CONSTRAINT ${constraint}
+       CHECK (workspace_id <> ${workspaceId} OR user_id <> ${userIds[1]} OR role <> 'owner') NOT VALID`,
+    );
+    const response = await transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      success: false, message: "Internal server error",
+      requestId: response.headers.get("x-request-id"),
+    });
+    expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE workspace_members DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test("concurrent transfers produce one success and exactly one owner", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const responses = await Promise.all([
+    transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken),
+    transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken),
+  ]);
+  expect(responses.map((response) => response.status).sort()).toEqual([200, 403]);
+  await Promise.all(responses.map((response) => response.json()));
+  expect(await membershipSnapshot(workspaceId)).toEqual([
+    expect.objectContaining({ user_id: userIds[0], role: "editor" }),
+    expect.objectContaining({ user_id: userIds[1], role: "owner" }),
+  ]);
+});
+
+test("a waiting transfer rechecks owner authority after the workspace lock is released", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken);
+    void pending.catch(() => {});
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+          AND $1::int = ANY(pg_blocking_pids(pid)) AND query ILIKE '%workspaces%'
+        ) AS blocked`, [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) { blocked = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(blocked).toBe(true);
+    // Simulate a competing committed transfer while the request is waiting.
+    await locker.query(
+      "UPDATE workspace_members SET role = 'editor' WHERE workspace_id = $1 AND user_id = $2",
+      [workspaceId, userIds[0]],
+    );
+    await locker.query(
+      "UPDATE workspace_members SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2",
+      [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("FORBIDDEN");
+    expect(await membershipSnapshot(workspaceId)).toEqual([
+      expect.objectContaining({ user_id: userIds[0], role: "editor" }),
+      expect.objectContaining({ user_id: userIds[1], role: "owner" }),
+    ]);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
 test("lists only the authenticated user's workspaces", async () => {
   const token = await login();
 

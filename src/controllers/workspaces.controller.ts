@@ -6,6 +6,7 @@ import {
   listWorkspaceMembers,
   listWorkspaces,
   removeWorkspaceMember,
+  transferWorkspaceOwnership,
 } from "../services/workspaces.service.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -161,4 +162,38 @@ export async function removeWorkspaceMemberController(
   await removeWorkspaceMember(wid, actorId, uid);
 
   return res.status(204).send();
+}
+
+export async function transferWorkspaceOwnershipController(
+  req: Request,
+  res: Response,
+) {
+  const actorId =
+    req.user && typeof req.user !== "string"
+      ? req.user.userId
+      : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(
+      401,
+      "UNAUTHENTICATED",
+      "Authentication required",
+    );
+  }
+
+  const { wid } = res.locals.validatedParams;
+  const { newOwnerId } = res.locals.validatedData;
+
+  const result = await transferWorkspaceOwnership(
+    wid,
+    actorId,
+    newOwnerId,
+  );
+
+  return res.status(200).json({ data: result });
 }

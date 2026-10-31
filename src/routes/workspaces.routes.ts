@@ -6,6 +6,7 @@ import {
   listWorkspaceMembersController,
   listWorkspacesController,
   removeWorkspaceMemberController,
+  transferWorkspaceOwnershipController,
 } from "../controllers/workspaces.controller.ts";
 import { createWorkspaceValidator } from "../validators/workspaces.validator.ts";
 import { listWorkspacesValidator } from "../validators/workspaces-list.validator.ts";
@@ -15,6 +16,7 @@ import { workspaceParamsValidator } from "../validators/workspaces-params.valida
 import { workspaceMembersListValidator } from "../validators/workspace-members-list.validator.ts";
 import { workspaceMemberParamsValidator } from "../validators/workspace-member-params.validator.ts";
 import { workspaceMemberRoleValidator } from "../validators/workspace-member-role.validator.ts";
+import { workspaceOwnershipTransferValidator } from "../validators/workspace-ownership-transfer.validator.ts";
 
 const router = Router();
 
@@ -54,6 +56,13 @@ router.delete(
   "/:wid/members/:uid",
   validate(workspaceMemberParamsValidator, messageProvider, "params"),
   removeWorkspaceMemberController,
+);
+
+router.post(
+  "/:wid/ownership-transfer",
+  validate(workspaceParamsValidator, messageProvider, "params"),
+  validate(workspaceOwnershipTransferValidator, messageProvider),
+  transferWorkspaceOwnershipController,
 );
 
 export default router;
