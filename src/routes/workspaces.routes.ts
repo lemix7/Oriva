@@ -17,6 +17,8 @@ import { workspaceMembersListValidator } from "../validators/workspace-members-l
 import { workspaceMemberParamsValidator } from "../validators/workspace-member-params.validator.ts";
 import { workspaceMemberRoleValidator } from "../validators/workspace-member-role.validator.ts";
 import { workspaceOwnershipTransferValidator } from "../validators/workspace-ownership-transfer.validator.ts";
+import { createInvitationValidator } from "../validators/invitations.validator.ts";
+import { createInvitationController } from "../controllers/invitations.controller.ts";
 
 const router = Router();
 
@@ -63,6 +65,13 @@ router.post(
   validate(workspaceParamsValidator, messageProvider, "params"),
   validate(workspaceOwnershipTransferValidator, messageProvider),
   transferWorkspaceOwnershipController,
+);
+
+router.post(
+  "/:wid/invitations",
+  validate(workspaceParamsValidator, messageProvider, "params"),
+  validate(createInvitationValidator, messageProvider),
+  createInvitationController,
 );
 
 export default router;

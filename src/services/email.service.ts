@@ -2,6 +2,7 @@ import { Resend } from "resend";
 import { requiredEnv } from "../config/env.ts";
 import { UnrecoverableError } from "bullmq";
 
+
 const resend = new Resend(requiredEnv("RESEND_API_KEY"));
 
 const newUserEmail = async function (
@@ -60,5 +61,50 @@ const newUserEmail = async function (
 
   return data;
 };
+
+export async function sendInvitationEmail(
+  email: string,
+  token: string,
+  idempotencyKey: string,
+) {
+  const { data, error } = await resend.emails.send(
+    {
+      from: requiredEnv("EMAIL_FROM"),
+      to: email,
+      subject: "You're invited to an Oriva workspace",
+      text: [
+        "You have been invited to join an Oriva workspace.",
+        "Sign in with this email address to accept.",
+        `Invitation token: ${token}`,
+        "This invitation expires in seven days.",
+      ].join("\n\n"),
+    },
+    {
+      signal: AbortSignal.timeout(5000),
+      idempotencyKey,
+    },
+  );
+
+  if (error) {
+    const retryable =
+      error.statusCode === null ||
+      error.statusCode === 408 ||
+      error.name === "rate_limit_exceeded" ||
+      error.name === "concurrent_idempotent_requests" ||
+      (error.statusCode !== null && error.statusCode >= 500);
+
+    if (!retryable) {
+      throw new UnrecoverableError(error.message);
+    }
+
+    throw new Error(error.message);
+  }
+
+  if (!data) {
+    throw new Error("Email provider returned no result");
+  }
+
+  return data;
+}
 
 export default newUserEmail;
