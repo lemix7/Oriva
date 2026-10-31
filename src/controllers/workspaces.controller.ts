@@ -5,6 +5,7 @@ import {
   getWorkspace,
   listWorkspaceMembers,
   listWorkspaces,
+  removeWorkspaceMember,
 } from "../services/workspaces.service.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -131,4 +132,33 @@ export async function changeWorkspaceMemberRoleController(
   const member = await changeWorkspaceMemberRole(wid, actorId, uid, role);
 
   return res.status(200).json({ data: member });
+}
+
+export async function removeWorkspaceMemberController(
+  req: Request,
+  res: Response,
+) {
+  const actorId =
+    req.user && typeof req.user !== "string"
+      ? req.user.userId
+      : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(
+      401,
+      "UNAUTHENTICATED",
+      "Authentication required",
+    );
+  }
+
+  const { wid, uid } = res.locals.validatedParams;
+
+  await removeWorkspaceMember(wid, actorId, uid);
+
+  return res.status(204).send();
 }

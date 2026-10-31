@@ -10,6 +10,7 @@ import {
   getWorkspaceMembers,
   lockWorkspace,
   updateWorkspaceMemberRole,
+  deleteWorkspaceMember,
 } from "../repositories/workspace.repository.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -137,5 +138,44 @@ export async function changeWorkspaceMemberRole(
     }
 
     return updated;
+  });
+}
+
+export async function removeWorkspaceMember(
+  workspaceId: number,
+  actorId: number,
+  memberId: number,
+) {
+  return db.transaction(async (tx) => {
+    const workspace = await lockWorkspace(tx, workspaceId);
+    const actor = await getWorkspaceMembership(workspaceId, actorId, tx);
+
+    if (!workspace || !actor) {
+      throw new AppError(404, "NOT_FOUND", "Workspace not found");
+    }
+
+    if (actor.role !== "owner") {
+      throw new AppError(403, "FORBIDDEN", "Only owners can remove members");
+    }
+
+    const member = await getWorkspaceMembership(workspaceId, memberId, tx);
+
+    if (!member) {
+      throw new AppError(404, "NOT_FOUND", "Workspace member not found");
+    }
+
+    if (member.role === "owner") {
+      throw new AppError(
+        409,
+        "OWNERSHIP_TRANSFER_REQUIRED",
+        "Transfer ownership before removing the owner",
+      );
+    }
+
+    const removed = await deleteWorkspaceMember(tx, workspaceId, memberId);
+
+    if (!removed) {
+      throw new AppError(409, "MEMBER_CHANGED", "Workspace member changed");
+    }
   });
 }
