@@ -140,3 +140,25 @@ export async function updateWorkspaceMemberRole(
 
   return member;
 }
+
+export async function deleteWorkspaceMember(
+  tx: Transaction,
+  workspaceId: number,
+  userId: number,
+) {
+  const [member] = await tx
+    .delete(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+        ne(workspaceMembers.role, "owner"),
+      ),
+    )
+    .returning({
+      workspaceId: workspaceMembers.workspaceId,
+      userId: workspaceMembers.userId,
+    });
+
+  return member;
+}

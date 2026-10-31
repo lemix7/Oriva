@@ -163,6 +163,14 @@ async function membershipSnapshot(workspaceId: number) {
   return result.rows;
 }
 
+async function removeMember(workspaceId: number | string, memberId: number | string, token: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/members/${memberId}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
 test("creation trims the name and assigns ownership to the authenticated user", async () => {
   const token = await login();
   const response = await create({
@@ -682,6 +690,210 @@ test("role changes wait for the workspace lock before updating", async () => {
     if (pending) {
       await pending.then((response) => response.text()).catch(() => {});
     }
+  }
+});
+
+test("the owner can remove a viewer and revoke access without deleting their account", async () => {
+  const ownerToken = await login();
+  const created = await create({ name: "Member removal team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const account = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+  const viewerToken = await login(account.rows[0].email);
+  const workspaceUrl = `${baseUrl}/workspaces/${workspace.id}`;
+  const before = await fetch(workspaceUrl, {
+    headers: { authorization: `Bearer ${viewerToken}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  expect(before.status).toBe(200);
+  await before.json();
+
+  const response = await fetch(`${workspaceUrl}/members/${userIds[1]}`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${ownerToken}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+
+  const membership = await pool!.query(
+    "SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    [workspace.id, userIds[1]],
+  );
+  expect(membership.rows).toEqual([]);
+  const savedAccount = await pool!.query("SELECT id FROM users WHERE id = $1", [userIds[1]]);
+  expect(savedAccount.rows).toEqual([{ id: userIds[1] }]);
+  expect(await membershipSnapshot(workspace.id)).toEqual([
+    expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+  ]);
+
+  // The previously issued token must no longer grant workspace access.
+  const denied = await fetch(workspaceUrl, {
+    headers: { authorization: `Bearer ${viewerToken}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  expect(denied.status).toBe(404);
+  expect(await denied.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace not found",
+      requestId: denied.headers.get("x-request-id"),
+    },
+  });
+});
+
+test.each(["editor", "viewer", "outsider"] as const)(
+  "a workspace %s cannot remove members",
+  async (role) => {
+    const ownerToken = await login();
+    const created = await create({ name: "Removal permissions team" }, ownerToken);
+    expect(created.status).toBe(201);
+    const { data: workspace } = await created.json();
+    if (role !== "outsider") {
+      await pool!.query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+        [workspace.id, userIds[1], role],
+      );
+    }
+    const account = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+    const token = await login(account.rows[0].email);
+    const before = await membershipSnapshot(workspace.id);
+
+    const response = await removeMember(workspace.id, userIds[0], token);
+
+    expect(response.status).toBe(role === "outsider" ? 404 : 403);
+    const body = await response.json();
+    expect(body.error).toEqual({
+      code: role === "outsider" ? "NOT_FOUND" : "FORBIDDEN",
+      message: role === "outsider" ? "Workspace not found" : "Only owners can remove members",
+      requestId: response.headers.get("x-request-id"),
+    });
+    expect(await membershipSnapshot(workspace.id)).toEqual(before);
+  },
+);
+
+test("the owner cannot remove themselves", async () => {
+  const token = await login();
+  const created = await create({ name: "Owner removal protection" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await removeMember(workspace.id, userIds[0], token);
+
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "OWNERSHIP_TRANSFER_REQUIRED",
+      message: "Transfer ownership before removing the owner",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("removing a user who is not a member returns 404", async () => {
+  const token = await login();
+  const created = await create({ name: "Missing removal member" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  const before = await membershipSnapshot(workspace.id);
+
+  const response = await removeMember(workspace.id, userIds[1], token);
+
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({
+    error: {
+      code: "NOT_FOUND",
+      message: "Workspace member not found",
+      requestId: response.headers.get("x-request-id"),
+    },
+  });
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("removal rejects invalid workspace and member IDs", async () => {
+  const token = await login();
+  const created = await create({ name: "Removal ID validation" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspace.id);
+
+  for (const invalidId of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "uid"]) {
+      const response = await removeMember(
+        field === "wid" ? invalidId : workspace.id,
+        field === "uid" ? invalidId : userIds[1], token,
+      );
+      expect(response.status).toBe(422);
+      const body = await response.json();
+      expect(body.errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect(await membershipSnapshot(workspace.id)).toEqual(before);
+});
+
+test("member removal waits for the workspace lock", async () => {
+  const token = await login();
+  const created = await create({ name: "Locked removal team" }, token);
+  expect(created.status).toBe(201);
+  const { data: workspace } = await created.json();
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspace.id, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspace.id);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspace.id]);
+    pending = removeMember(workspace.id, userIds[1], token);
+    void pending.catch(() => {});
+
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND $1::int = ANY(pg_blocking_pids(pid))
+             AND query ILIKE '%workspaces%'
+         ) AS blocked`,
+        [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) {
+        blocked = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(blocked).toBe(true);
+    expect(await membershipSnapshot(workspace.id)).toEqual(before);
+    await locker.query("COMMIT");
+
+    const response = await pending;
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    expect(await membershipSnapshot(workspace.id)).toEqual([
+      expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+    ]);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
   }
 });
 

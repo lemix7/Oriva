@@ -5,6 +5,7 @@ import {
   getWorkspaceController,
   listWorkspaceMembersController,
   listWorkspacesController,
+  removeWorkspaceMemberController,
 } from "../controllers/workspaces.controller.ts";
 import { createWorkspaceValidator } from "../validators/workspaces.validator.ts";
 import { listWorkspacesValidator } from "../validators/workspaces-list.validator.ts";
@@ -47,6 +48,12 @@ router.patch(
   validate(workspaceMemberParamsValidator, messageProvider, "params"),
   validate(workspaceMemberRoleValidator, messageProvider),
   changeWorkspaceMemberRoleController,
+);
+
+router.delete(
+  "/:wid/members/:uid",
+  validate(workspaceMemberParamsValidator, messageProvider, "params"),
+  removeWorkspaceMemberController,
 );
 
 export default router;
