@@ -1315,6 +1315,329 @@ test("sender deletion cascades to invitations they issued", async () => {
     .toEqual([{ id: workspaceId }]);
 });
 
+async function acceptanceFixture() {
+  const fixture = await ownershipFixture("outsider");
+  const account = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[1]]);
+  return { ...fixture, email: account.rows[0].email as string };
+}
+
+async function issueInvitation(workspaceId: number, email: string, ownerToken: string, role = "viewer") {
+  const response = await invite(workspaceId, { email, role }, ownerToken);
+  expect(response.status).toBe(201);
+  const { data } = await response.json();
+  const call = queueEmail.mock.calls[queueEmail.mock.calls.length - 1]!;
+  const payload = call[1] as { token: string; invitationId: number };
+  expect(payload.invitationId).toBe(data.id);
+  return { id: data.id as number, token: payload.token };
+}
+
+async function acceptInvite(token: unknown, authToken?: string, extra: object = {}) {
+  return fetch(`${baseUrl}/invitations/accept`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+    },
+    body: JSON.stringify({ token, ...extra }),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["editor", "viewer"])("an invited recipient can join as %s and reuse is rejected", async (role) => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken, role);
+  const response = await acceptInvite(invitation.token, otherToken, {
+    userId: userIds[0], email: ownerEmail, role: "owner", workspaceId: -1,
+  });
+  expect(response.status).toBe(201);
+  expect(await response.json()).toEqual({
+    data: { workspaceId, userId: userIds[1], role },
+  });
+  const [saved] = await savedInvitations(workspaceId);
+  expect(saved.accepted_at).toBeInstanceOf(Date);
+  expect(saved.revoked_at).toBeNull();
+  expect(await membershipSnapshot(workspaceId)).toEqual([
+    expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+    expect.objectContaining({ user_id: userIds[1], role }),
+  ]);
+  const repeated = await acceptInvite(invitation.token, otherToken);
+  expect(repeated.status).toBe(409);
+  expect((await repeated.json()).error.code).toBe("INVITATION_UNAVAILABLE");
+});
+
+test("acceptance requires authentication and a valid token format", async () => {
+  const response = await acceptInvite(undefined);
+  expect(response.status).toBe(401);
+  await response.text();
+  const token = await login();
+  for (const malformed of [undefined, null, 42, "", "a".repeat(63), "a".repeat(65), "g".repeat(64)]) {
+    const invalid = await acceptInvite(malformed, token);
+    expect(invalid.status).toBe(422);
+    expect((await invalid.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "token" }),
+    ]));
+  }
+  const unknown = await acceptInvite("0".repeat(64), token);
+  expect(unknown.status).toBe(404);
+  expect((await unknown.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("the wrong account cannot accept or close someone else's invitation", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const before = await savedInvitations(workspaceId);
+  const memberships = await membershipSnapshot(workspaceId);
+  // The owner is already a member, but email matching must precede closure.
+  const response = await acceptInvite(invitation.token, ownerToken, { email });
+  expect(response.status).toBe(403);
+  expect((await response.json()).error.code).toBe("INVITATION_EMAIL_MISMATCH");
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+  expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+});
+
+test("acceptance compares the current database email, not request identity fields", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  await pool!.query("UPDATE users SET email = $1 WHERE id = $2", ["changed@test.local", userIds[1]]);
+  const response = await acceptInvite(invitation.token, otherToken, { email });
+  expect(response.status).toBe(403);
+  await response.json();
+  expect((await savedInvitations(workspaceId))[0].accepted_at).toBeNull();
+});
+
+test.each(["expired", "revoked", "accepted"])("a %s invitation cannot create membership", async (state) => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const statements: Record<string, string> = {
+    expired: "UPDATE invitations SET expires_at = now() - interval '1 minute' WHERE id = $1",
+    revoked: "UPDATE invitations SET revoked_at = now() WHERE id = $1",
+    accepted: "UPDATE invitations SET accepted_at = now() WHERE id = $1",
+  };
+  await pool!.query(statements[state], [invitation.id]);
+  const before = await savedInvitations(workspaceId);
+  const memberships = await membershipSnapshot(workspaceId);
+  const response = await acceptInvite(invitation.token, otherToken);
+  expect(response.status).toBe(409);
+  expect((await response.json()).error.code).toBe("INVITATION_UNAVAILABLE");
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+  expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+});
+
+test("acceptance revokes other pending invitations only for that recipient and workspace", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const chosen = await issueInvitation(workspaceId, email, ownerToken);
+  const alternative = await issueInvitation(workspaceId, email, ownerToken, "editor");
+  const unrelated = await issueInvitation(workspaceId, "someone@example.com", ownerToken);
+  const otherWorkspace = await create({ name: "Another invitation team" }, ownerToken);
+  expect(otherWorkspace.status).toBe(201);
+  const { data: other } = await otherWorkspace.json();
+  await issueInvitation(other.id, email, ownerToken);
+  const otherBefore = await savedInvitations(other.id);
+
+  const response = await acceptInvite(chosen.token, otherToken);
+  expect(response.status).toBe(201);
+  await response.json();
+  const rows = await savedInvitations(workspaceId);
+  expect(rows.find((row) => row.id === chosen.id).accepted_at).toBeInstanceOf(Date);
+  expect(rows.find((row) => row.id === alternative.id).revoked_at).toBeInstanceOf(Date);
+  expect(rows.find((row) => row.id === unrelated.id).revoked_at).toBeNull();
+  expect(await savedInvitations(other.id)).toEqual(otherBefore);
+  // Even after removal, the second invitation cannot be used to rejoin.
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  const denied = await acceptInvite(alternative.token, otherToken);
+  expect(denied.status).toBe(409);
+  await denied.json();
+});
+
+test("an existing member keeps their role and closes pending invitations despite the 409", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const first = await issueInvitation(workspaceId, email, ownerToken, "viewer");
+  await issueInvitation(workspaceId, email, ownerToken, "editor");
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'editor')",
+    [workspaceId, userIds[1]],
+  );
+  const before = await membershipSnapshot(workspaceId);
+  const response = await acceptInvite(first.token, otherToken);
+  expect(response.status).toBe(409);
+  expect((await response.json()).error.code).toBe("ALREADY_MEMBER");
+  expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  for (const saved of await savedInvitations(workspaceId)) {
+    expect(saved.accepted_at).toBeNull();
+    expect(saved.revoked_at).toBeInstanceOf(Date);
+  }
+});
+
+test.each(["accepted", "revoked"])("failure writing %s state rolls back the entire acceptance", async (stage) => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const chosen = await issueInvitation(workspaceId, email, ownerToken);
+  const alternative = await issueInvitation(workspaceId, email, ownerToken);
+  const before = await savedInvitations(workspaceId);
+  const memberships = await membershipSnapshot(workspaceId);
+  const constraint = `accept_failure_${randomUUID().replace(/-/g, "")}`;
+  const id = stage === "accepted" ? chosen.id : alternative.id;
+  const column = stage === "accepted" ? "accepted_at" : "revoked_at";
+  try {
+    await pool!.query(
+      `ALTER TABLE invitations ADD CONSTRAINT ${constraint} CHECK (id <> ${id} OR ${column} IS NULL) NOT VALID`,
+    );
+    const response = await acceptInvite(chosen.token, otherToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedInvitations(workspaceId)).toEqual(before);
+    expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+  } finally {
+    await pool!.query(`ALTER TABLE invitations DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["same", "different"])("concurrent acceptance of %s tokens creates only one membership", async (which) => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const first = await issueInvitation(workspaceId, email, ownerToken);
+  const second = which === "same" ? first : await issueInvitation(workspaceId, email, ownerToken);
+  const responses = await Promise.all([
+    acceptInvite(first.token, otherToken), acceptInvite(second.token, otherToken),
+  ]);
+  expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+  await Promise.all(responses.map((response) => response.json()));
+  expect(await membershipSnapshot(workspaceId)).toEqual([
+    expect.objectContaining({ user_id: userIds[0], role: "owner" }),
+    expect.objectContaining({ user_id: userIds[1], role: "viewer" }),
+  ]);
+  const saved = await savedInvitations(workspaceId);
+  expect(saved.filter((row) => row.accepted_at !== null)).toHaveLength(1);
+  expect(saved.every((row) => row.accepted_at || row.revoked_at)).toBe(true);
+});
+
+test("acceptance rereads revocation after waiting for the workspace lock", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = acceptInvite(invitation.token, otherToken);
+    void pending.catch(() => {});
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+         WHERE datname = current_database() AND $1::int = ANY(pg_blocking_pids(pid))) AS blocked`,
+        [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) { blocked = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(blocked).toBe(true);
+    await locker.query("UPDATE invitations SET revoked_at = now() WHERE id = $1", [invitation.id]);
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("INVITATION_UNAVAILABLE");
+    expect(await membershipSnapshot(workspaceId)).toHaveLength(1);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+test("member removal revokes pending invitations and prevents rejoining", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const first = await issueInvitation(workspaceId, email, ownerToken);
+  await issueInvitation(workspaceId, email, ownerToken);
+  const unrelated = await issueInvitation(workspaceId, "unrelated@example.com", ownerToken);
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspaceId, userIds[1]],
+  );
+
+  const response = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect(await membershipSnapshot(workspaceId)).toHaveLength(1);
+  const invitations = await savedInvitations(workspaceId);
+  for (const row of invitations.filter((row) => row.email === email)) {
+    expect(row.revoked_at).toBeInstanceOf(Date);
+    expect(row.accepted_at).toBeNull();
+  }
+  expect(invitations.find((row) => row.id === unrelated.id).revoked_at).toBeNull();
+  const denied = await acceptInvite(first.token, otherToken);
+  expect(denied.status).toBe(409);
+  expect((await denied.json()).error.code).toBe("INVITATION_UNAVAILABLE");
+});
+
+test("failed invitation revocation rolls back member removal and earlier revocations", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  await issueInvitation(workspaceId, email, ownerToken);
+  const second = await issueInvitation(workspaceId, email, ownerToken);
+  await pool!.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    [workspaceId, userIds[1]],
+  );
+  const memberships = await membershipSnapshot(workspaceId);
+  const invitations = await savedInvitations(workspaceId);
+  const constraint = `removal_revoke_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(
+      `ALTER TABLE invitations ADD CONSTRAINT ${constraint} CHECK (id <> ${second.id} OR revoked_at IS NULL) NOT VALID`,
+    );
+    const response = await removeMember(workspaceId, userIds[1], ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+    expect(await savedInvitations(workspaceId)).toEqual(invitations);
+  } finally {
+    await pool!.query(`ALTER TABLE invitations DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["owner", "editor", "viewer"] as const)(
+  "inviting an existing %s is rejected regardless of email casing or spaces",
+  async (role) => {
+    const { workspaceId, ownerToken } = await ownershipFixture(role === "owner" ? "outsider" : role);
+    const memberId = role === "owner" ? userIds[0] : userIds[1];
+    const account = await pool!.query("SELECT email FROM users WHERE id = $1", [memberId]);
+    const email = account.rows[0].email as string;
+    // Legacy account emails may themselves contain casing or whitespace.
+    await pool!.query("UPDATE users SET email = $1 WHERE id = $2", [` ${email.toUpperCase()} `, memberId]);
+    const before = await membershipSnapshot(workspaceId);
+
+    for (const requestedEmail of [email, email.toUpperCase(), `  ${email.toUpperCase()}  `]) {
+      const response = await invite(workspaceId, { email: requestedEmail, role: "viewer" }, ownerToken);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ error: {
+        code: "ALREADY_MEMBER",
+        message: "This user already belongs to the workspace",
+        requestId: response.headers.get("x-request-id"),
+      } });
+    }
+
+    expect(await savedInvitations(workspaceId)).toEqual([]);
+    expect(queueEmail).not.toHaveBeenCalled();
+    expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  },
+);
+
+test("membership in another workspace does not prevent an invitation here", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const otherWorkspace = await create({ name: "Recipient's own team" }, otherToken);
+  expect(otherWorkspace.status).toBe(201);
+  const { data: other } = await otherWorkspace.json();
+  const otherBefore = await membershipSnapshot(other.id);
+
+  const response = await invite(workspaceId, { email, role: "editor" }, ownerToken);
+
+  expect(response.status).toBe(201);
+  expect((await response.json()).data).toMatchObject({ workspaceId, email, role: "editor" });
+  expect(await savedInvitations(workspaceId)).toHaveLength(1);
+  expect(queueEmail).toHaveBeenCalledTimes(1);
+  expect(await membershipSnapshot(other.id)).toEqual(otherBefore);
+});
+
 test("lists only the authenticated user's workspaces", async () => {
   const token = await login();
 
