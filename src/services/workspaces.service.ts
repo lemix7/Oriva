@@ -11,6 +11,8 @@ import {
   lockWorkspace,
   updateWorkspaceMemberRole,
   deleteWorkspaceMember,
+  promoteWorkspaceOwner,
+  demoteWorkspaceOwner,
 } from "../repositories/workspace.repository.ts";
 import { AppError } from "../shared/app-error.ts";
 
@@ -177,5 +179,56 @@ export async function removeWorkspaceMember(
     if (!removed) {
       throw new AppError(409, "MEMBER_CHANGED", "Workspace member changed");
     }
+  });
+}
+
+export async function transferWorkspaceOwnership(
+  workspaceId: number,
+  actorId: number,
+  newOwnerId: number,
+) {
+  return db.transaction(async (tx) => {
+    const workspace = await lockWorkspace(tx, workspaceId);
+    const actor = await getWorkspaceMembership(workspaceId, actorId, tx);
+
+    if (!workspace || !actor) {
+      throw new AppError(404, "NOT_FOUND", "Workspace not found");
+    }
+
+    if (actor.role !== "owner") {
+      throw new AppError(
+        403,
+        "FORBIDDEN",
+        "Only owners can transfer ownership",
+      );
+    }
+
+    if (actorId === newOwnerId) {
+      throw new AppError(
+        409,
+        "ALREADY_OWNER",
+        "You already own this workspace",
+      );
+    }
+
+    const target = await getWorkspaceMembership(workspaceId, newOwnerId, tx);
+
+    if (!target) {
+      throw new AppError(404, "NOT_FOUND", "Workspace member not found");
+    }
+
+    const formerOwner = await demoteWorkspaceOwner(tx, workspaceId, actorId);
+
+    if (!formerOwner) {
+      throw new AppError(409, "MEMBER_CHANGED", "Workspace member changed");
+    }
+
+    const newOwner = await promoteWorkspaceOwner(tx, workspaceId, newOwnerId);
+
+    if (!newOwner) {
+      throw new AppError(409, "MEMBER_CHANGED", "Workspace member changed");
+    }
+
+    return { formerOwner, newOwner };
   });
 }

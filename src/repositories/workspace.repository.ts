@@ -162,3 +162,58 @@ export async function deleteWorkspaceMember(
 
   return member;
 }
+
+// to change ownership the owner role should be changed first because two owner can't co-exist
+export async function demoteWorkspaceOwner(
+  tx: Transaction,
+  workspaceId: number,
+  userId: number,
+) {
+  const [member] = await tx
+    .update(workspaceMembers)
+    .set({
+      role: "editor",
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+        eq(workspaceMembers.role, "owner"),
+      ),
+    )
+    .returning({
+      workspaceId: workspaceMembers.workspaceId,
+      userId: workspaceMembers.userId,
+      role: workspaceMembers.role,
+    });
+
+  return member;
+}
+
+export async function promoteWorkspaceOwner(
+  tx: Transaction,
+  workspaceId: number,
+  userId: number,
+) {
+  const [member] = await tx
+    .update(workspaceMembers)
+    .set({
+      role: "owner",
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+        ne(workspaceMembers.role, "owner"),
+      ),
+    )
+    .returning({
+      workspaceId: workspaceMembers.workspaceId,
+      userId: workspaceMembers.userId,
+      role: workspaceMembers.role,
+    });
+
+  return member;
+}
