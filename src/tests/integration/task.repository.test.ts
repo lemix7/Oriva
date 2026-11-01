@@ -172,7 +172,7 @@ test("user B can delete their own task without deleting the other task", async (
 
 test("task list and lookup preserve the previous flat joined response", async () => {
   const previous = await pool!.query(
-    "SELECT * FROM tasks t INNER JOIN projects p ON t.project_id = p.id WHERE p.user_id = $1 AND p.id = $2 ORDER BY t.title",
+    "SELECT t.*, p.id, p.name, p.description, p.status, p.created_at, p.user_id, p.task_cache_version FROM tasks t INNER JOIN projects p ON t.project_id = p.id WHERE p.user_id = $1 AND p.id = $2 ORDER BY t.title",
     [userBId, projectId],
   );
   const rows = await repository.findTasksForUser(userBId, String(projectId));
@@ -185,7 +185,10 @@ test("task list and lookup preserve the previous flat joined response", async ()
 test("owned-project lookup and cache version reject another owner", async () => {
   expect(await repository.findOwnedProject(String(projectId), userAId)).toBeNull();
   expect(await repository.findTaskCacheVersion(userAId, String(projectId))).toBeNull();
-  const previous = await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId]);
+  const previous = await pool!.query(
+    "SELECT id, name, description, status, created_at, user_id, task_cache_version FROM projects WHERE id = $1",
+    [projectId],
+  );
   expect(await repository.findOwnedProject(String(projectId), userBId)).toEqual(previous.rows[0]);
   expect(await repository.findTaskCacheVersion(userBId, String(projectId)))
     .toBe(previous.rows[0].task_cache_version);

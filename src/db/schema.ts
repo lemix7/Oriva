@@ -37,8 +37,11 @@ export const projects = pgTable(
     userId: integer("user_id"),
     // You can use { mode: "bigint" } if numbers are exceeding js number limitations
     taskCacheVersion: bigint("task_cache_version", { mode: "bigint" })
-    .default(sql`0`)
-    .notNull(),
+      .default(sql`0`)
+      .notNull(),
+    workspaceId: integer("workspace_id").references(() => workspaces.id, {
+      onDelete: "restrict",
+    }),
   },
   (table) => [
     foreignKey({
@@ -144,11 +147,8 @@ export const invitations = pgTable(
       length: 10,
       enum: ["editor", "viewer"],
     }).notNull(),
-    tokenHash: varchar("token_hash", { length: 64 })
-      .notNull()
-      .unique(),
-    expiresAt: timestamp("expires_at", { withTimezone: true })
-      .notNull(),
+    tokenHash: varchar("token_hash", { length: 64 }).notNull().unique(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     acceptedAt: timestamp("accepted_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     invitedBy: integer("invited_by")
@@ -162,10 +162,7 @@ export const invitations = pgTable(
       .notNull(),
   },
   (table) => [
-    check(
-      "invitations_role_check",
-      sql`${table.role} IN ('editor', 'viewer')`,
-    ),
+    check("invitations_role_check", sql`${table.role} IN ('editor', 'viewer')`),
     index("invitations_workspace_idx").on(table.workspaceId),
     index("invitations_invited_by_idx").on(table.invitedBy),
   ],

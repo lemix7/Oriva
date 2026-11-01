@@ -8,8 +8,8 @@ import vine, { errors } from "@vinejs/vine";
   // }
 
 const CreateProjectSchema = vine.object({
-  name: vine.string().minLength(3),
-  description: vine.string().optional(),
+  name: vine.string().minLength(3).maxLength(100),
+  description: vine.string().maxLength(255).optional(),
   status: vine.enum(['active' , 'inactive' , 'pending' , 'completed']),
 });
 

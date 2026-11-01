@@ -33,6 +33,7 @@ let userAEmail: string;
 let userBEmail: string;
 let userBId: number;
 let projectId: number;
+let taskId: number;
 const password = "test-password";
 const userIds: number[] = [];
 const projectIds: number[] = [];
@@ -86,11 +87,17 @@ beforeEach(async () => {
   );
   projectId = result.rows[0].id;
   projectIds.push(projectId);
+  const task = await pool!.query(
+    "INSERT INTO tasks (project_id, title) VALUES ($1, 'Retired-route task') RETURNING id",
+    [projectId],
+  );
+  taskId = task.rows[0].id;
 });
 
 afterEach(async () => {
   if (!pool) return;
   if (projectIds.length) {
+    await pool.query("DELETE FROM tasks WHERE project_id = ANY($1::int[])", [projectIds]);
     await pool.query("DELETE FROM projects WHERE id = ANY($1::int[])", [projectIds]);
     projectIds.length = 0;
   }
@@ -133,29 +140,48 @@ async function loginAs(email: string): Promise<string> {
   return body.token;
 }
 
-test("A logs in but cannot read B's project; B logs in and can read it", async () => {
-  // Use real tokens obtained over HTTP, not fabricated req.user objects.
-  const tokenA = await loginAs(userAEmail);
-  const denied = await fetch(`${baseUrl}/users/projects/${projectId}`, {
-    headers: { Authorization: `Bearer ${tokenA}` },
-    signal: AbortSignal.timeout(5000),
-  });
-  expect(denied.status).toBe(404);
-  expect(await denied.json()).toEqual({ message: "Project not found" });
+test("retired project and task routes deny both creators and outsiders without changing records", async () => {
+  const projectBefore = await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId]);
+  const taskBefore = await pool!.query("SELECT * FROM tasks WHERE id = $1", [taskId]);
+  const routes = [
+    ["GET", "/users/projects"],
+    ["POST", "/users/projects"],
+    ["GET", `/users/projects/${projectId}`],
+    ["PATCH", `/users/projects/${projectId}`],
+    ["DELETE", `/users/projects/${projectId}`],
+    ["POST", `/users/projects/1/projects`],
+    ["GET", `/projects/${projectId}/tasks`],
+    ["POST", `/projects/${projectId}/tasks`],
+    ["GET", `/projects/${projectId}/tasks/${taskId}`],
+    ["PATCH", `/projects/${projectId}/tasks/${taskId}`],
+    ["DELETE", `/projects/${projectId}/tasks/${taskId}`],
+  ] as const;
 
-  // The positive control proves the project exists and the route is working.
-  const tokenB = await loginAs(userBEmail);
-  const allowed = await fetch(`${baseUrl}/users/projects/${projectId}`, {
-    headers: { Authorization: `Bearer ${tokenB}` },
-    signal: AbortSignal.timeout(5000),
-  });
-  expect(allowed.status).toBe(200);
-  expect(await allowed.json()).toMatchObject({
-    id: projectId,
-    user_id: userBId,
-    name: "HTTP ownership project",
-    status: "active",
-  });
+  for (const email of [userAEmail, userBEmail]) {
+    const token = await loginAs(email);
+    for (const [method, path] of routes) {
+      const response = await fetch(`${baseUrl}${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        ...(method === "POST" || method === "PATCH"
+          ? { body: JSON.stringify({ name: "Unexpected project", title: "Unexpected task", status: "active" }) }
+          : {}),
+        signal: AbortSignal.timeout(5000),
+      });
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: {
+        code: "NOT_FOUND", message: "Route not found",
+        requestId: response.headers.get("x-request-id"),
+      } });
+    }
+  }
+
+  expect((await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId])).rows).toEqual(projectBefore.rows);
+  expect((await pool!.query("SELECT * FROM tasks WHERE id = $1", [taskId])).rows).toEqual(taskBefore.rows);
+  expect((await pool!.query("SELECT id FROM projects WHERE user_id = ANY($1::int[])", [userIds])).rows)
+    .toEqual([{ id: projectId }]);
+  expect((await pool!.query("SELECT id FROM tasks WHERE project_id = $1", [projectId])).rows)
+    .toEqual([{ id: taskId }]);
 
   for (const dependency of [addEmailJob, uploadProfilePicture, deleteProfilePicture, cacheGet, cacheSet]) {
     expect(dependency).not.toHaveBeenCalled();

@@ -35,6 +35,13 @@ jest.unstable_mockModule("../repositories/task.repository.js", () => ({
 jest.unstable_mockModule("../services/task-cache.service.js", () => ({
   getCachedTasks,
 }));
+jest.unstable_mockModule("../services/tasks.service.js", () => ({
+  listWorkspaceTasks: jest.fn(),
+  getWorkspaceTask: jest.fn(),
+  createWorkspaceTask: jest.fn(),
+  editWorkspaceTask: jest.fn(),
+  removeWorkspaceTask: jest.fn(),
+}));
 
 const { create_task, get_tasks, get_task_by_Id, update_task, delete_task } =
   await import("../controllers/tasks.controller.ts");
