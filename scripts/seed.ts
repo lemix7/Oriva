@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { and, eq, sql } from "drizzle-orm";
-import { projects, tasks, users } from "../src/db/schema.ts";
+import { projects, tasks, users, workspaces, workspaceMembers } from "../src/db/schema.ts";
 
 export function seedDatabaseUrl(connectionString: string | undefined): string {
   if (!connectionString) throw new Error("TEST_DATABASE_URL is required");
@@ -13,7 +13,8 @@ export function seedDatabaseUrl(connectionString: string | undefined): string {
   if (
     !["postgres:", "postgresql:"].includes(url.protocol) ||
     !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ||
-    url.searchParams.has("host") || url.searchParams.has("hostaddr")
+    url.searchParams.has("host") ||
+    url.searchParams.has("hostaddr")
   ) {
     throw new Error("Seeding requires local PostgreSQL");
   }
@@ -22,7 +23,9 @@ export function seedDatabaseUrl(connectionString: string | undefined): string {
 }
 
 // Reuse existing demo records so reruns preserve local edits and passwords.
-export async function seedDemo(db: Pick<NodePgDatabase, "transaction">): Promise<void> {
+export async function seedDemo(
+  db: Pick<NodePgDatabase, "transaction">,
+): Promise<void> {
   await db.transaction(async (tx) => {
     // Serialize seed runs: email and project names currently have no unique constraints.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(71342, 1)`);
@@ -37,30 +40,83 @@ export async function seedDemo(db: Pick<NodePgDatabase, "transaction">): Promise
 
     let ownerId = existingUser?.id;
     if (ownerId === undefined) {
-      const [createdUser] = await tx.insert(users).values({
-        name: "Demo Owner",
-        email,
-        password: await bcrypt.hash("LocalDemo123!", 10),
-        role: "user",
-      }).returning({ id: users.id });
+      const [createdUser] = await tx
+        .insert(users)
+        .values({
+          name: "Demo Owner",
+          email,
+          password: await bcrypt.hash("LocalDemo123!", 10),
+          role: "user",
+        })
+        .returning({ id: users.id });
       ownerId = createdUser.id;
     }
+
+    const [existingWorkspace] = await tx
+      .select({ id: workspaces.id })
+      .from(workspaces)
+      .where(
+        and(
+          eq(workspaces.createdBy, ownerId),
+          eq(workspaces.name, "Demo Workspace"),
+        ),
+      )
+      .limit(1);
+
+    let workspaceId = existingWorkspace?.id;
+
+    if (workspaceId === undefined) {
+      const [createdWorkspace] = await tx
+        .insert(workspaces)
+        .values({
+          name: "Demo Workspace",
+          createdBy: ownerId,
+          createdAt,
+          updatedAt: createdAt,
+        })
+        .returning({ id: workspaces.id });
+
+      workspaceId = createdWorkspace.id;
+    }
+
+    await tx
+      .insert(workspaceMembers)
+      .values({
+        workspaceId,
+        userId: ownerId,
+        role: "owner",
+        createdAt,
+        updatedAt: createdAt,
+      })
+      .onConflictDoNothing({
+        target: [workspaceMembers.workspaceId, workspaceMembers.userId],
+      });
 
     const [existingProject] = await tx
       .select({ id: projects.id })
       .from(projects)
-      .where(and(eq(projects.userId, ownerId), eq(projects.name, "Demo Project")))
+      .where(
+        and(
+          eq(projects.workspaceId, workspaceId),
+          eq(projects.userId, ownerId),
+          eq(projects.name, "Demo Project"),
+        ),
+      )
       .limit(1);
 
     let projectId = existingProject?.id;
     if (projectId === undefined) {
-      const [createdProject] = await tx.insert(projects).values({
-        name: "Demo Project",
-        description: "Local demo project",
-        status: "active",
-        userId: ownerId,
-        createdAt,
-      }).returning({ id: projects.id });
+      const [createdProject] = await tx
+        .insert(projects)
+        .values({
+          name: "Demo Project",
+          description: "Local demo project",
+          status: "active",
+          userId: ownerId,
+          workspaceId,
+          createdAt,
+        })
+        .returning({ id: projects.id });
       projectId = createdProject.id;
     }
 
@@ -103,9 +159,14 @@ async function main(): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
   main().catch(() => {
-    console.error("Local demo seed failed. Check local PostgreSQL, .env.test, and migrations.");
+    console.error(
+      "Local demo seed failed. Check local PostgreSQL, .env.test, and migrations.",
+    );
     process.exitCode = 1;
   });
 }

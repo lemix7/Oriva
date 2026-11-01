@@ -39,9 +39,11 @@ export const projects = pgTable(
     taskCacheVersion: bigint("task_cache_version", { mode: "bigint" })
       .default(sql`0`)
       .notNull(),
-    workspaceId: integer("workspace_id").references(() => workspaces.id, {
-      onDelete: "restrict",
-    }),
+    workspaceId: integer("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, {
+        onDelete: "restrict",
+      }),
   },
   (table) => [
     foreignKey({

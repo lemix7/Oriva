@@ -17,9 +17,6 @@ jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => 
   uploadProfilePicture: jest.fn(),
   deleteProfilePicture: jest.fn(),
 }));
-jest.unstable_mockModule("../../config/task-cache.js", () => ({
-  default: { get: jest.fn(), set: jest.fn() },
-}));
 
 const requestLog = jest.spyOn(console, "log").mockImplementation(() => {});
 const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});

@@ -12,17 +12,12 @@ import dotenv from "dotenv";
 const addEmailJob = jest.fn();
 const uploadProfilePicture = jest.fn();
 const deleteProfilePicture = jest.fn();
-const cacheGet = jest.fn();
-const cacheSet = jest.fn();
 jest.unstable_mockModule("../../queue/email.que.js", () => ({
   default: { add: addEmailJob },
 }));
 jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => ({
   uploadProfilePicture,
   deleteProfilePicture,
-}));
-jest.unstable_mockModule("../../config/task-cache.js", () => ({
-  default: { get: cacheGet, set: cacheSet },
 }));
 
 let pool: Pool | undefined;
@@ -37,6 +32,7 @@ let taskId: number;
 const password = "test-password";
 const userIds: number[] = [];
 const projectIds: number[] = [];
+const workspaceIds: number[] = [];
 const originalDatabaseUrl = process.env.DATABASE_URL;
 const originalSecret = process.env.SECRET_KEY;
 
@@ -81,9 +77,14 @@ beforeEach(async () => {
     userIds.push(result.rows[0].id);
   }
   userBId = userIds[1]!;
+  const workspace = await pool!.query(
+    "INSERT INTO workspaces (name, created_by) VALUES ('Retired-route fixture', $1) RETURNING id",
+    [userBId],
+  );
+  workspaceIds.push(workspace.rows[0].id);
   const result = await pool!.query(
-    "INSERT INTO projects (name, description, status, user_id) VALUES ($1, $2, $3, $4) RETURNING id",
-    ["HTTP ownership project", "Owned by B", "active", userBId],
+    "INSERT INTO projects (name, description, status, user_id, workspace_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    ["HTTP ownership project", "Owned by B", "active", userBId, workspace.rows[0].id],
   );
   projectId = result.rows[0].id;
   projectIds.push(projectId);
@@ -100,6 +101,10 @@ afterEach(async () => {
     await pool.query("DELETE FROM tasks WHERE project_id = ANY($1::int[])", [projectIds]);
     await pool.query("DELETE FROM projects WHERE id = ANY($1::int[])", [projectIds]);
     projectIds.length = 0;
+  }
+  if (workspaceIds.length) {
+    await pool.query("DELETE FROM workspaces WHERE id = ANY($1::int[])", [workspaceIds]);
+    workspaceIds.length = 0;
   }
   if (userIds.length) {
     await pool.query("DELETE FROM users WHERE id = ANY($1::int[])", [userIds]);
@@ -183,7 +188,7 @@ test("retired project and task routes deny both creators and outsiders without c
   expect((await pool!.query("SELECT id FROM tasks WHERE project_id = $1", [projectId])).rows)
     .toEqual([{ id: taskId }]);
 
-  for (const dependency of [addEmailJob, uploadProfilePicture, deleteProfilePicture, cacheGet, cacheSet]) {
+  for (const dependency of [addEmailJob, uploadProfilePicture, deleteProfilePicture]) {
     expect(dependency).not.toHaveBeenCalled();
   }
 });
