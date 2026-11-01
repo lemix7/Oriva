@@ -1,6 +1,6 @@
 import { db } from "../db/index.ts";
 import { invitations, users, workspaceMembers } from "../db/schema.ts";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, sql } from "drizzle-orm";
 
 type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -59,10 +59,7 @@ export async function lockInvitation(
   return invitation;
 }
 
-export async function getInvitationRecipient(
-  tx: Transaction,
-  userId: number,
-) {
+export async function getInvitationRecipient(tx: Transaction, userId: number) {
   const [user] = await tx
     .select({
       id: users.id,
@@ -73,7 +70,7 @@ export async function getInvitationRecipient(
     .limit(1);
 
   return user;
-} 
+}
 
 export async function insertInvitedMembership(
   tx: Transaction,
@@ -159,4 +156,58 @@ export async function getWorkspaceMemberByEmail(
     .limit(1);
 
   return member;
+}
+
+export const INVITATION_PAGE_SIZE = 20;
+
+export async function getWorkspaceInvitations(
+  workspaceId: number,
+  afterId = 0,
+) {
+  return db
+    .select({
+      id: invitations.id,
+      email: invitations.email,
+      role: invitations.role,
+      invitedBy: invitations.invitedBy,
+      expiresAt: invitations.expiresAt,
+      acceptedAt: invitations.acceptedAt,
+      revokedAt: invitations.revokedAt,
+      createdAt: invitations.createdAt,
+    })
+    .from(invitations)
+    .where(
+      and(
+        eq(invitations.workspaceId, workspaceId),
+        gt(invitations.id, afterId),
+      ),
+    )
+    .orderBy(asc(invitations.id))
+    .limit(INVITATION_PAGE_SIZE + 1);
+}
+
+export async function markInvitationRevoked(
+  tx: Transaction,
+  workspaceId: number,
+  invitationId: number,
+) {
+  const now = new Date();
+
+  const [invitation] = await tx
+    .update(invitations)
+    .set({
+      revokedAt: now,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(invitations.workspaceId, workspaceId),
+        eq(invitations.id, invitationId),
+        isNull(invitations.acceptedAt),
+        isNull(invitations.revokedAt),
+      ),
+    )
+    .returning({ id: invitations.id });
+
+  return invitation;
 }

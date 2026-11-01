@@ -12,13 +12,17 @@ import { AppError } from "../shared/app-error.ts";
 import {
   getInvitationByTokenHash,
   getInvitationRecipient,
+  getWorkspaceInvitations,
   getWorkspaceMemberByEmail,
   insertInvitation,
   insertInvitedMembership,
+  INVITATION_PAGE_SIZE,
   lockInvitation,
   markInvitationAccepted,
+  markInvitationRevoked,
   revokePendingInvitations,
 } from "../repositories/invitations.repository.ts";
+import { requireWorkspaceRole } from "./workspaces.service.ts";
 
 export async function createWorkspaceInvitation(
   workspaceId: number,
@@ -155,4 +159,68 @@ export async function acceptWorkspaceInvitation(token: string, userId: number) {
   }
 
   return result.membership;
+}
+
+export async function listWorkspaceInvitations(
+  workspaceId: number,
+  userId: number,
+  afterId = 0,
+) {
+  await requireWorkspaceRole(workspaceId, userId, ["owner"]);
+
+  const results = await getWorkspaceInvitations(workspaceId, afterId);
+  const hasNextPage = results.length > INVITATION_PAGE_SIZE;
+  const data = results.slice(0, INVITATION_PAGE_SIZE);
+
+  return {
+    data,
+    nextCursor: hasNextPage ? data[data.length - 1].id : null,
+  };
+}
+
+export async function revokeWorkspaceInvitation(
+  workspaceId: number,
+  invitationId: number,
+  actorId: number,
+) {
+  return db.transaction(async (tx) => {
+    const workspace = await lockWorkspace(tx, workspaceId);
+    const actor = await getWorkspaceMembership(workspaceId, actorId, tx);
+
+    if (!workspace || !actor) {
+      throw new AppError(404, "NOT_FOUND", "Workspace not found");
+    }
+
+    if (actor.role !== "owner") {
+      throw new AppError(
+        403,
+        "FORBIDDEN",
+        "Only owners can revoke invitations",
+      );
+    }
+
+    const invitation = await lockInvitation(tx, workspaceId, invitationId);
+
+    if (!invitation) {
+      throw new AppError(404, "NOT_FOUND", "Invitation not found");
+    }
+
+    if (invitation.acceptedAt) {
+      throw new AppError(
+        409,
+        "INVITATION_ALREADY_ACCEPTED",
+        "Use member removal to revoke workspace access",
+      );
+    }
+
+    if (invitation.revokedAt) {
+      return;
+    }
+
+    const revoked = await markInvitationRevoked(tx, workspaceId, invitationId);
+
+    if (!revoked) {
+      throw new AppError(409, "INVITATION_CHANGED", "Invitation state changed");
+    }
+  });
 }

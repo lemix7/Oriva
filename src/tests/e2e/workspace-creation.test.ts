@@ -1638,6 +1638,388 @@ test("membership in another workspace does not prevent an invitation here", asyn
   expect(await membershipSnapshot(other.id)).toEqual(otherBefore);
 });
 
+async function listInvitations(workspaceId: number | string, token?: string, cursor?: string) {
+  const url = new URL(`${baseUrl}/workspaces/${workspaceId}/invitations`);
+  if (cursor !== undefined) url.searchParams.set("afterId", cursor);
+  return fetch(url, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test("an owner gets an empty invitation page for a workspace without invitations", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const response = await listInvitations(workspaceId, ownerToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test("invitation listing includes history, excludes other workspaces, and exposes no credentials", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const issued = [];
+  for (const state of ["pending", "accepted", "revoked", "expired"]) {
+    const invitation = await issueInvitation(workspaceId, `${state}@example.com`, ownerToken);
+    issued.push(invitation);
+    if (state === "accepted") {
+      await pool!.query("UPDATE invitations SET accepted_at = now() WHERE id = $1", [invitation.id]);
+    } else if (state === "revoked") {
+      await pool!.query("UPDATE invitations SET revoked_at = now() WHERE id = $1", [invitation.id]);
+    } else if (state === "expired") {
+      await pool!.query("UPDATE invitations SET expires_at = now() - interval '1 minute' WHERE id = $1", [invitation.id]);
+    }
+  }
+  const otherCreated = await create({ name: "Another invitation workspace" }, ownerToken);
+  expect(otherCreated.status).toBe(201);
+  const { data: otherWorkspace } = await otherCreated.json();
+  await issueInvitation(otherWorkspace.id, "hidden@example.com", ownerToken);
+  const before = await savedInvitations(workspaceId);
+
+  const response = await listInvitations(workspaceId, ownerToken);
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body).toEqual({
+    data: before.map((row) => ({
+      id: row.id, email: row.email, role: row.role, invitedBy: row.invited_by,
+      expiresAt: row.expires_at.toISOString(),
+      acceptedAt: row.accepted_at?.toISOString() ?? null,
+      revokedAt: row.revoked_at?.toISOString() ?? null,
+      createdAt: row.created_at.toISOString(),
+    })),
+    page: { nextCursor: null },
+  });
+  for (const invitation of issued) {
+    expect(JSON.stringify(body)).not.toContain(invitation.token);
+  }
+  for (const row of before) expect(JSON.stringify(body)).not.toContain(row.token_hash);
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+});
+
+test.each([20, 21])("invitation pagination handles %i records with accurate cursors", async (count) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const prefix = randomUUID().replace(/-/g, "");
+  const inserted = await pool!.query(
+    `INSERT INTO invitations (workspace_id, email, role, token_hash, expires_at, invited_by)
+     SELECT $1, 'page' || n::text || '@example.com', 'viewer',
+       $3::text || lpad(n::text, 32, '0'), now() + interval '7 days', $2
+     FROM generate_series(1, $4::int) AS n RETURNING id`,
+    [workspaceId, userIds[0], prefix, count],
+  );
+  const ids: number[] = inserted.rows.map((row) => row.id).sort((a, b) => a - b);
+  const firstResponse = await listInvitations(workspaceId, ownerToken, "0");
+  expect(firstResponse.status).toBe(200);
+  const first = await firstResponse.json();
+  expect(first.data.map((row: { id: number }) => row.id)).toEqual(ids.slice(0, 20));
+  expect(first.page.nextCursor).toBe(count === 21 ? ids[19] : null);
+
+  if (count === 21) {
+    const secondResponse = await listInvitations(workspaceId, ownerToken, String(first.page.nextCursor));
+    expect(secondResponse.status).toBe(200);
+    const second = await secondResponse.json();
+    expect(second.data.map((row: { id: number }) => row.id)).toEqual(ids.slice(20));
+    expect(second.page.nextCursor).toBeNull();
+  }
+  const beyondResponse = await listInvitations(workspaceId, ownerToken, "2147483647");
+  expect(beyondResponse.status).toBe(200);
+  expect(await beyondResponse.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test.each(["editor", "viewer", "outsider"] as const)(
+  "an %s cannot list workspace invitations",
+  async (role) => {
+    const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+    await issueInvitation(workspaceId, "private@example.com", ownerToken);
+    const before = await savedInvitations(workspaceId);
+    const response = await listInvitations(workspaceId, otherToken);
+    expect(response.status).toBe(role === "outsider" ? 404 : 403);
+    const body = await response.json();
+    expect(body.error.code).toBe(role === "outsider" ? "NOT_FOUND" : "FORBIDDEN");
+    expect(body.data).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain("private@example.com");
+    expect(await savedInvitations(workspaceId)).toEqual(before);
+  },
+);
+
+test("invitation listing requires authentication before validating the workspace ID", async () => {
+  const response = await listInvitations("invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("listing invitations for a missing workspace returns 404", async () => {
+  const token = await login();
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  const response = await listInvitations(2147483647, token);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("invitation listing rejects invalid workspace IDs and cursors", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const id of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    const response = await listInvitations(id, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "wid" }),
+    ]));
+  }
+  for (const cursor of ["abc", "-1", "1.5", "2147483648"]) {
+    const response = await listInvitations(workspaceId, ownerToken, cursor);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "afterId" }),
+    ]));
+  }
+});
+
+test("invitation list access follows current ownership, even with previously issued tokens", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture();
+  const invitation = await issueInvitation(workspaceId, "private@example.com", ownerToken);
+  const transfer = await transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken);
+  expect(transfer.status).toBe(200);
+  await transfer.json();
+
+  const former = await listInvitations(workspaceId, ownerToken);
+  expect(former.status).toBe(403);
+  await former.json();
+  const current = await listInvitations(workspaceId, otherToken);
+  expect(current.status).toBe(200);
+  expect((await current.json()).data).toEqual([
+    expect.objectContaining({ id: invitation.id, email: "private@example.com" }),
+  ]);
+});
+
+async function revokeInvitation(workspaceId: number | string, invitationId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/invitations/${invitationId}`, {
+    method: "DELETE",
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test("the owner can revoke an invitation, preserve history, and block acceptance", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const beforeMemberships = await membershipSnapshot(workspaceId);
+  const response = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  const [saved] = await savedInvitations(workspaceId);
+  expect(saved.id).toBe(invitation.id);
+  expect(saved.revoked_at).toBeInstanceOf(Date);
+  expect(saved.updated_at).toEqual(saved.revoked_at);
+  expect(saved.accepted_at).toBeNull();
+  expect(await membershipSnapshot(workspaceId)).toEqual(beforeMemberships);
+  const denied = await acceptInvite(invitation.token, otherToken);
+  expect(denied.status).toBe(409);
+  expect((await denied.json()).error.code).toBe("INVITATION_UNAVAILABLE");
+
+  const repeated = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+  expect(repeated.status).toBe(204);
+  expect(await repeated.text()).toBe("");
+  expect(await savedInvitations(workspaceId)).toEqual([saved]);
+  expect(queueEmail).toHaveBeenCalledTimes(1);
+});
+
+test.each(["editor", "viewer", "outsider"] as const)(
+  "an %s cannot revoke invitations",
+  async (role) => {
+    const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+    const invitation = await issueInvitation(workspaceId, "private@example.com", ownerToken);
+    const before = await savedInvitations(workspaceId);
+    const response = await revokeInvitation(workspaceId, invitation.id, otherToken);
+    expect(response.status).toBe(role === "outsider" ? 404 : 403);
+    expect((await response.json()).error.code).toBe(role === "outsider" ? "NOT_FOUND" : "FORBIDDEN");
+    expect(await savedInvitations(workspaceId)).toEqual(before);
+  },
+);
+
+test("revocation requires authentication before ID validation", async () => {
+  const response = await revokeInvitation("invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("accepted invitations cannot be revoked and their memberships remain intact", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const accepted = await acceptInvite(invitation.token, otherToken);
+  expect(accepted.status).toBe(201);
+  await accepted.json();
+  const invitations = await savedInvitations(workspaceId);
+  const memberships = await membershipSnapshot(workspaceId);
+  const response = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: {
+    code: "INVITATION_ALREADY_ACCEPTED",
+    message: "Use member removal to revoke workspace access",
+    requestId: response.headers.get("x-request-id"),
+  } });
+  expect(await savedInvitations(workspaceId)).toEqual(invitations);
+  expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+});
+
+test("expired but unused invitations can still be explicitly revoked", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  await pool!.query("UPDATE invitations SET expires_at = now() - interval '1 day' WHERE id = $1", [invitation.id]);
+  const response = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect((await savedInvitations(workspaceId))[0].revoked_at).toBeInstanceOf(Date);
+});
+
+test("an invitation ID cannot be used under a different workspace, even with ownership of both", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const created = await create({ name: "Other revocation team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const before = await savedInvitations(workspaceId);
+  const response = await revokeInvitation(other.id, invitation.id, ownerToken);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.message).toBe("Invitation not found");
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+});
+
+test("missing workspaces and missing invitations return 404", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM invitations WHERE id = 2147483647")).rows).toEqual([]);
+  const before = await savedInvitations(workspaceId);
+  for (const [wid, iid] of [[2147483647, invitation.id], [workspaceId, 2147483647]]) {
+    const response = await revokeInvitation(wid, iid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+});
+
+test("revocation rejects malformed workspace and invitation IDs without mutations", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const before = await savedInvitations(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "iid"]) {
+      const response = await revokeInvitation(
+        field === "wid" ? invalid : workspaceId,
+        field === "iid" ? invalid : invitation.id, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+});
+
+test("only the current owner can revoke after an ownership transfer", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture();
+  const invitation = await issueInvitation(workspaceId, "recipient@example.com", ownerToken);
+  const transfer = await transferOwnership(workspaceId, { newOwnerId: userIds[1] }, ownerToken);
+  expect(transfer.status).toBe(200);
+  await transfer.json();
+  const before = await savedInvitations(workspaceId);
+  const former = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+  expect(former.status).toBe(403);
+  await former.json();
+  expect(await savedInvitations(workspaceId)).toEqual(before);
+  const current = await revokeInvitation(workspaceId, invitation.id, otherToken);
+  expect(current.status).toBe(204);
+  await current.text();
+  expect((await savedInvitations(workspaceId))[0].revoked_at).toBeInstanceOf(Date);
+});
+
+test("a failed revocation write leaves the invitation usable and unchanged", async () => {
+  const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const before = await savedInvitations(workspaceId);
+  const constraint = `revoke_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(
+      `ALTER TABLE invitations ADD CONSTRAINT ${constraint} CHECK (id <> ${invitation.id} OR revoked_at IS NULL) NOT VALID`,
+    );
+    const response = await revokeInvitation(workspaceId, invitation.id, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedInvitations(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE invitations DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+  const accepted = await acceptInvite(invitation.token, otherToken);
+  expect(accepted.status).toBe(201);
+  await accepted.json();
+});
+
+test("concurrent revocations both succeed with one revoked invitation", async () => {
+  const { workspaceId, ownerToken, email } = await acceptanceFixture();
+  const invitation = await issueInvitation(workspaceId, email, ownerToken);
+  const responses = await Promise.all([
+    revokeInvitation(workspaceId, invitation.id, ownerToken),
+    revokeInvitation(workspaceId, invitation.id, ownerToken),
+  ]);
+  expect(responses.map((response) => response.status)).toEqual([204, 204]);
+  await Promise.all(responses.map((response) => response.text()));
+  expect(await savedInvitations(workspaceId)).toEqual([
+    expect.objectContaining({ id: invitation.id, revoked_at: expect.any(Date), accepted_at: null }),
+  ]);
+});
+
+test.each(["acceptance", "revocation"])(
+  "%s winning the lock determines the result of the competing operation",
+  async (winner) => {
+    const { workspaceId, ownerToken, otherToken, email } = await acceptanceFixture();
+    const invitation = await issueInvitation(workspaceId, email, ownerToken);
+    const locker = await pool!.connect();
+    let first: Promise<Response> | undefined;
+    let second: Promise<Response> | undefined;
+    try {
+      await locker.query("BEGIN");
+      const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+      // Hold only the invitation row: the first API request can acquire the workspace lock.
+      await locker.query("SELECT id FROM invitations WHERE id = $1 FOR UPDATE", [invitation.id]);
+      first = winner === "acceptance"
+        ? acceptInvite(invitation.token, otherToken)
+        : revokeInvitation(workspaceId, invitation.id, ownerToken);
+      void first.catch(() => {});
+      let blocked = false;
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const waiting = await pool!.query(
+          `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+           WHERE datname = current_database() AND $1::int = ANY(pg_blocking_pids(pid))) AS blocked`,
+          [pid.rows[0].pid],
+        );
+        if (waiting.rows[0].blocked) { blocked = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(blocked).toBe(true);
+      second = winner === "acceptance"
+        ? revokeInvitation(workspaceId, invitation.id, ownerToken)
+        : acceptInvite(invitation.token, otherToken);
+      void second.catch(() => {});
+      await locker.query("COMMIT");
+      const [won, lost] = await Promise.all([first, second]);
+      expect(won.status).toBe(winner === "acceptance" ? 201 : 204);
+      if (won.status === 204) await won.text(); else await won.json();
+      expect(lost.status).toBe(409);
+      expect((await lost.json()).error.code).toBe(
+        winner === "acceptance" ? "INVITATION_ALREADY_ACCEPTED" : "INVITATION_UNAVAILABLE",
+      );
+      const [saved] = await savedInvitations(workspaceId);
+      expect(saved.accepted_at !== null).toBe(winner === "acceptance");
+      expect(saved.revoked_at !== null).toBe(winner === "revocation");
+      expect(await membershipSnapshot(workspaceId)).toHaveLength(winner === "acceptance" ? 2 : 1);
+    } finally {
+      try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+      await Promise.all([first, second].map(async (request) => {
+        if (request) await request.then((response) => response.text()).catch(() => {});
+      }));
+    }
+  },
+);
+
 test("lists only the authenticated user's workspaces", async () => {
   const token = await login();
 
