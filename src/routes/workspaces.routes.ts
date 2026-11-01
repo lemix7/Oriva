@@ -25,6 +25,22 @@ import {
 } from "../controllers/invitations.controller.ts";
 import { listInvitationsValidator } from "../validators/invitation-list.validator.ts";
 import { invitationParamsValidator } from "../validators/invitation-params.validator.ts";
+import {
+  createWorkspaceProjectController,
+  editWorkspaceProjectController,
+  getWorkspaceProjectController,
+  listWorkspaceProjectsController,
+  removeWorkspaceProjectController,
+} from "../controllers/projects.controller.ts";
+import createProjectValidator from "../validators/projects.validator.ts";
+import { listProjectsValidator } from "../validators/project-list.validator.ts";
+import { workspaceProjectParamsValidator } from "../validators/workspace-project-params.validator.ts";
+import { updateProjectValidator } from "../validators/project-update.validator.ts";
+import { listTasksValidator } from "../validators/task-list.validator.ts";
+import { createWorkspaceTaskController, editWorkspaceTaskController, getWorkspaceTaskController, listWorkspaceTasksController, removeWorkspaceTaskController } from "../controllers/tasks.controller.ts";
+import { workspaceTaskParamsValidator } from "../validators/workspace-task-params.validator.ts";
+import { createWorkspaceTaskValidator } from "../validators/workspace-task-create-validator.ts";
+import { updateWorkspaceTaskValidator } from "../validators/workspace-task-update.validator.ts";
 
 const router = Router();
 
@@ -91,6 +107,72 @@ router.delete(
   "/:wid/invitations/:iid",
   validate(invitationParamsValidator, messageProvider, "params"),
   revokeInvitationController,
+);
+
+router.post(
+  "/:wid/projects",
+  validate(workspaceParamsValidator, messageProvider, "params"),
+  validate(createProjectValidator, messageProvider),
+  createWorkspaceProjectController,
+);
+
+router.get(
+  "/:wid/projects",
+  validate(workspaceParamsValidator, messageProvider, "params"),
+  validate(listProjectsValidator, messageProvider, "query"),
+  listWorkspaceProjectsController,
+);
+
+router.get(
+  "/:wid/projects/:pid",
+  validate(workspaceProjectParamsValidator, messageProvider, "params"),
+  getWorkspaceProjectController,
+);
+
+router.patch(
+  "/:wid/projects/:pid",
+  validate(workspaceProjectParamsValidator, messageProvider, "params"),
+  validate(updateProjectValidator, messageProvider),
+  editWorkspaceProjectController,
+);
+
+router.delete(
+  "/:wid/projects/:pid",
+  validate(workspaceProjectParamsValidator, messageProvider, "params"),
+  removeWorkspaceProjectController,
+);
+
+router.get(
+  "/:wid/projects/:pid/tasks",
+  validate(workspaceProjectParamsValidator, messageProvider, "params"),
+  validate(listTasksValidator, messageProvider, "query"),
+  listWorkspaceTasksController,
+);
+
+router.get(
+  "/:wid/projects/:pid/tasks/:tid",
+  validate(workspaceTaskParamsValidator, messageProvider, "params"),
+  getWorkspaceTaskController,
+);
+  
+router.post(
+  "/:wid/projects/:pid/tasks",
+  validate(workspaceProjectParamsValidator, messageProvider, "params"),
+  validate(createWorkspaceTaskValidator, messageProvider),
+  createWorkspaceTaskController,
+);
+
+router.patch(
+  "/:wid/projects/:pid/tasks/:tid",
+  validate(workspaceTaskParamsValidator, messageProvider, "params"),
+  validate(updateWorkspaceTaskValidator, messageProvider),
+  editWorkspaceTaskController,
+);
+
+router.delete(
+  "/:wid/projects/:pid/tasks/:tid",
+  validate(workspaceTaskParamsValidator, messageProvider, "params"),
+  removeWorkspaceTaskController,
 );
 
 export default router;

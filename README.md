@@ -121,25 +121,43 @@ port 6379 for local development. Keep dollar-containing `.env` values such as
 
 These endpoints require authentication but currently do not enforce per-user ownership or administrator roles. User reads currently select all columns, including password hashes; review access control and response fields before exposing these endpoints publicly.
 
-### Protected project endpoints
+### Workspace project endpoints
 
-- `GET /users/projects` — lists the authenticated user's projects.
-- `GET /users/projects/:project_id` — retrieves an owned project.
-- `POST /users/projects` — creates a project.
-- `PATCH /users/projects/:project_id` — marks an owned project as `completed`.
-- `DELETE /users/projects/:project_id` — deletes an owned project.
+- `POST /workspaces/:wid/projects` — creates a project; requires owner/editor membership.
+- `GET /workspaces/:wid/projects` — lists workspace projects with cursor pagination.
+- `GET /workspaces/:wid/projects/:pid` — reads a project; requires workspace membership.
+- `PATCH /workspaces/:wid/projects/:pid` — updates name, description, or status; requires owner/editor membership.
+- `DELETE /workspaces/:wid/projects/:pid` — deletes an empty project; requires owner membership.
+
+Project creation is available only through the workspace endpoint. The former
+`POST /users/projects` endpoint is removed and returns 404. Database
+`workspace_id` remains nullable temporarily for legacy records and fixtures.
+
+### Retired project endpoints
+
+All `/users/projects` routes are retired and return 404 for authenticated
+requests. Read and modify projects only through `/workspaces/:wid/projects`.
+Records without a workspace remain stored but are not exposed through HTTP;
+their database backfill and the non-null constraint are still pending.
 
 Project creation accepts `name` (at least 3 characters), optional `description`, and `status`: `active`, `inactive`, `pending`, or `completed`.
 
-### Protected task endpoints
+### Workspace task endpoints
 
-- `GET /projects/:project_id/tasks` — lists tasks in an owned project.
-- `GET /projects/:project_id/tasks/:task_id` — retrieves matching task records.
-- `POST /projects/:project_id/tasks` — creates a task in an owned project.
-- `PATCH /projects/:project_id/tasks/:task_id` — marks a task as `done`.
-- `DELETE /projects/:project_id/tasks/:task_id` — deletes a task in an owned project.
+All task endpoints require workspace membership.
 
-Task creation accepts `title` (at least 3 characters), optional `description`, and `status`: `done`, `cancelled`, or `on progress`.
+- `GET /workspaces/:wid/projects/:pid/tasks` — lists tasks with cursor pagination using `?afterId=TASK_ID`.
+- `GET /workspaces/:wid/projects/:pid/tasks/:tid` — reads one task.
+- `POST /workspaces/:wid/projects/:pid/tasks` — creates a task; requires owner/editor membership.
+- `PATCH /workspaces/:wid/projects/:pid/tasks/:tid` — updates a task; requires owner/editor membership.
+- `DELETE /workspaces/:wid/projects/:pid/tasks/:tid` — deletes a task; requires owner/editor membership.
+
+Viewers can read tasks but cannot create, update, or delete them.
+
+The legacy `/projects/:project_id/tasks` routes are retired and return 404 for
+authenticated requests. Their creator-only authorization could bypass workspace
+membership, including after member removal. Existing tasks remain stored.
+The old controllers and repositories remain for the migration.
 
 Send the token on protected requests:
 
@@ -175,23 +193,27 @@ curl -X POST http://localhost:4000/login \
   -d '{"email":"alex@example.com","password":"example-password"}'
 ```
 
-Create a project:
+Create a workspace first (use the returned workspace ID in the project URL):
 
 ```bash
-curl -X POST http://localhost:4000/users/projects \
+curl -X POST http://localhost:4000/workspaces \
+  -H 'Authorization: Bearer YOUR_TOKEN' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"My team"}'
+```
+
+Create a project in workspace `1`, replacing that ID with your own:
+
+```bash
+curl -X POST http://localhost:4000/workspaces/1/projects \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{"name":"Website launch","description":"Prepare the launch","status":"active"}'
 ```
 
-Use the returned project ID to create a task, replacing `1` as needed:
-
-```bash
-curl -X POST http://localhost:4000/projects/1/tasks \
-  -H 'Authorization: Bearer YOUR_TOKEN' \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"Draft homepage","status":"on progress"}'
-```
+Use the returned project ID to read or update it under
+`/workspaces/1/projects/PROJECT_ID`, and manage its tasks under
+`/workspaces/1/projects/PROJECT_ID/tasks`. Legacy task URLs are no longer supported.
 
 ## Project structure
 

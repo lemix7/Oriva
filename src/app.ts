@@ -5,8 +5,6 @@ import express, {
   type Express,
   response,
 } from "express";
-import projectRouter from "./routes/project.routes.ts";
-import taskRouter from "./routes/task.routes.ts";
 import userRouter from "./routes/users.routes.ts";
 import errorHandling from "./middleware/error-handling.ts";
 import looger from "./middleware/logger.ts";
@@ -56,8 +54,17 @@ app.use(authenticateJWT);
 // Protected endpoints
 app.use("/invitations", invitationRouter);
 app.use("/workspaces", workspaceRouter);
-app.use("/users/projects", projectRouter);
-app.use("/projects", taskRouter);
+// Retire creator-only project/task URLs before the /users/:user_id router
+// can interpret "projects" as a user ID. Workspace routes enforce membership.
+app.use(["/users/projects", "/projects"], (_req, res) => {
+  res.status(404).json({
+    error: {
+      code: "NOT_FOUND",
+      message: "Route not found",
+      requestId: res.locals.requestId,
+    },
+  });
+});
 app.use("/users", userRouter);
 
 app.use(errorHandling);

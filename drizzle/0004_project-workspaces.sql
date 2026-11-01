@@ -1,0 +1,2 @@
+ALTER TABLE "projects" ADD COLUMN "workspace_id" integer;--> statement-breakpoint
+ALTER TABLE "projects" ADD CONSTRAINT "projects_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE restrict ON UPDATE no action;

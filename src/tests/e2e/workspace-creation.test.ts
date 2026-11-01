@@ -77,6 +77,16 @@ beforeEach(async () => {
 afterEach(async () => {
   if (!pool || userIds.length === 0) return;
   // Only remove records belonging to the accounts created by this test.
+  await pool.query(
+    `DELETE FROM tasks WHERE project_id IN (
+       SELECT p.id FROM projects p INNER JOIN workspaces w ON p.workspace_id = w.id
+       WHERE w.created_by = ANY($1::int[])
+     )`, [userIds],
+  );
+  await pool.query(
+    "DELETE FROM projects WHERE workspace_id IN (SELECT id FROM workspaces WHERE created_by = ANY($1::int[]))",
+    [userIds],
+  );
   await pool.query("DELETE FROM workspaces WHERE created_by = ANY($1::int[])", [userIds]);
   await pool.query("DELETE FROM users WHERE id = ANY($1::int[])", [userIds]);
   userIds = [];
@@ -2019,6 +2029,1596 @@ test.each(["acceptance", "revocation"])(
     }
   },
 );
+
+async function createProjectInWorkspace(workspaceId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function workspaceProjects(workspaceId: number) {
+  return (await pool!.query("SELECT * FROM projects WHERE workspace_id = $1 ORDER BY id", [workspaceId])).rows;
+}
+
+test.each(["owner", "editor"] as const)("an %s can create a workspace project without spoofing its workspace or creator", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const actorId = role === "owner" ? userIds[0] : userIds[1];
+  const token = role === "owner" ? ownerToken : otherToken;
+  const response = await createProjectInWorkspace(workspaceId, {
+    name: "Shared project", description: "A collaborative project", status: "active",
+    workspaceId: -1, workspace_id: -1, userId: -1, user_id: -1, createdBy: -1,
+  }, token);
+  expect(response.status).toBe(201);
+  const body = await response.json();
+  const [saved] = await workspaceProjects(workspaceId);
+  expect(body).toEqual({ data: {
+    id: saved.id, workspaceId, createdBy: actorId,
+    name: "Shared project", description: "A collaborative project", status: "active",
+    createdAt: saved.created_at.toISOString(),
+  } });
+  expect(saved.user_id).toBe(actorId);
+  expect(saved.workspace_id).toBe(workspaceId);
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot create workspace projects", async (role) => {
+  const { workspaceId, otherToken } = await ownershipFixture(role);
+  const response = await createProjectInWorkspace(workspaceId, { name: "Forbidden project", status: "active" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await workspaceProjects(workspaceId)).toEqual([]);
+});
+
+test("workspace project creation requires authentication before validation", async () => {
+  const response = await createProjectInWorkspace("invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("project creation in a missing workspace returns 404", async () => {
+  const token = await login();
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  const response = await createProjectInWorkspace(2147483647, { name: "Missing workspace", status: "active" }, token);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("workspace projects support every valid status and an omitted description", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const status of ["active", "inactive", "pending", "completed"]) {
+    const response = await createProjectInWorkspace(workspaceId, { name: `Project ${status}`, status }, ownerToken);
+    expect(response.status).toBe(201);
+    expect((await response.json()).data).toMatchObject({ status, description: null });
+  }
+  expect(await workspaceProjects(workspaceId)).toHaveLength(4);
+});
+
+test("workspace project creation rejects invalid IDs and project fields", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    const response = await createProjectInWorkspace(invalid, { name: "Valid project", status: "active" }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "wid" }),
+    ]));
+  }
+  const invalidFields = [
+    { field: "name", value: undefined }, { field: "name", value: "ab" },
+    { field: "name", value: 123 }, { field: "name", value: "x".repeat(101) },
+    { field: "description", value: 123 }, { field: "description", value: "x".repeat(256) },
+    { field: "status", value: undefined }, { field: "status", value: "owner" },
+  ];
+  for (const { field, value } of invalidFields) {
+    const response = await createProjectInWorkspace(workspaceId, {
+      name: "Valid project", status: "active", [field]: value,
+    }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field }),
+    ]));
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual([]);
+});
+
+test("failed workspace project insertion creates no project or membership changes", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const before = await membershipSnapshot(workspaceId);
+  const constraint = `workspace_project_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(
+      `ALTER TABLE projects ADD CONSTRAINT ${constraint} CHECK (workspace_id <> ${workspaceId}) NOT VALID`,
+    );
+    const response = await createProjectInWorkspace(workspaceId, { name: "Failed project", status: "active" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await workspaceProjects(workspaceId)).toEqual([]);
+    expect(await membershipSnapshot(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE projects DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test("project creation rechecks membership after waiting for the workspace lock", async () => {
+  const { workspaceId, otherToken } = await ownershipFixture("editor");
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = createProjectInWorkspace(workspaceId, { name: "Stale editor project", status: "active" }, otherToken);
+    void pending.catch(() => {});
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+         AND $1::int = ANY(pg_blocking_pids(pid))) AS blocked`, [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) { blocked = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(blocked).toBe(true);
+    await locker.query(
+      "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2",
+      [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("FORBIDDEN");
+    expect(await workspaceProjects(workspaceId)).toEqual([]);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+async function listProjects(workspaceId: number | string, token?: string, cursor?: string) {
+  const url = new URL(`${baseUrl}/workspaces/${workspaceId}/projects`);
+  if (cursor !== undefined) url.searchParams.set("afterId", cursor);
+  return fetch(url, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor", "viewer"] as const)("a workspace %s can list projects created by another member", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role === "owner" ? "editor" : role);
+  const creatorToken = role === "owner" ? otherToken : ownerToken;
+  const readerToken = role === "owner" ? ownerToken : otherToken;
+  const created = await createProjectInWorkspace(workspaceId, {
+    name: "Shared team project", status: "active", description: "Visible to all members",
+  }, creatorToken);
+  expect(created.status).toBe(201);
+  const { data: project } = await created.json();
+
+  const response = await listProjects(workspaceId, readerToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [project], page: { nextCursor: null } });
+});
+
+test("project lists are scoped to the URL workspace even when the user owns both", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const otherCreated = await create({ name: "Separate projects team" }, ownerToken);
+  expect(otherCreated.status).toBe(201);
+  const { data: other } = await otherCreated.json();
+  const visibleResponse = await createProjectInWorkspace(workspaceId, { name: "Visible project", status: "active" }, ownerToken);
+  const hiddenResponse = await createProjectInWorkspace(other.id, { name: "Hidden project", status: "pending" }, ownerToken);
+  expect(visibleResponse.status).toBe(201);
+  expect(hiddenResponse.status).toBe(201);
+  const { data: visible } = await visibleResponse.json();
+  await hiddenResponse.json();
+
+  const response = await listProjects(workspaceId, ownerToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [visible], page: { nextCursor: null } });
+});
+
+test("an empty workspace returns an empty project page", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const response = await listProjects(workspaceId, ownerToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test.each([20, 21])("project pagination handles %i records without omissions or repeats", async (count) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const inserted = await pool!.query(
+    `INSERT INTO projects (workspace_id, user_id, name, status)
+     SELECT $1, $2, 'Project ' || n::text, 'active'
+     FROM generate_series(1, $3::int) AS n RETURNING id`,
+    [workspaceId, userIds[0], count],
+  );
+  const ids: number[] = inserted.rows.map((row) => row.id).sort((a, b) => a - b);
+  const response = await listProjects(workspaceId, ownerToken, "0");
+  expect(response.status).toBe(200);
+  const first = await response.json();
+  expect(first.data.map((row: { id: number }) => row.id)).toEqual(ids.slice(0, 20));
+  expect(first.page.nextCursor).toBe(count === 21 ? ids[19] : null);
+  if (count === 21) {
+    const nextResponse = await listProjects(workspaceId, ownerToken, String(first.page.nextCursor));
+    expect(nextResponse.status).toBe(200);
+    const next = await nextResponse.json();
+    expect(next.data.map((row: { id: number }) => row.id)).toEqual(ids.slice(20));
+    expect(next.page.nextCursor).toBeNull();
+  }
+  const beyond = await listProjects(workspaceId, ownerToken, "2147483647");
+  expect(beyond.status).toBe(200);
+  expect(await beyond.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test("outsiders cannot list private workspace projects", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const created = await createProjectInWorkspace(workspaceId, { name: "Private project", status: "active" }, ownerToken);
+  expect(created.status).toBe(201);
+  await created.json();
+  const response = await listProjects(workspaceId, otherToken);
+  expect(response.status).toBe(404);
+  const body = await response.json();
+  expect(body.error.code).toBe("NOT_FOUND");
+  expect(body.data).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain("Private project");
+});
+
+test("project listing requires authentication before validating the ID", async () => {
+  const response = await listProjects("invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("listing projects in a nonexistent workspace returns 404", async () => {
+  const token = await login();
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  const response = await listProjects(2147483647, token);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("project listing rejects invalid workspace IDs and cursors", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    const response = await listProjects(invalid, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "wid" }),
+    ]));
+  }
+  for (const invalid of ["abc", "-1", "1.5", "2147483648"]) {
+    const response = await listProjects(workspaceId, ownerToken, invalid);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "afterId" }),
+    ]));
+  }
+});
+
+test("a removed project creator cannot list workspace projects with their existing token", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const created = await createProjectInWorkspace(workspaceId, { name: "Former member project", status: "active" }, otherToken);
+  expect(created.status).toBe(201);
+  const { data: project } = await created.json();
+  const before = await listProjects(workspaceId, otherToken);
+  expect(before.status).toBe(200);
+  await before.json();
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+
+  const denied = await listProjects(workspaceId, otherToken);
+  expect(denied.status).toBe(404);
+  expect((await denied.json()).error.code).toBe("NOT_FOUND");
+  const ownerResponse = await listProjects(workspaceId, ownerToken);
+  expect(ownerResponse.status).toBe(200);
+  expect(await ownerResponse.json()).toEqual({ data: [project], page: { nextCursor: null } });
+});
+
+async function getProject(workspaceId: number | string, projectId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function projectFixtureForHttp(workspaceId: number, token: string) {
+  const response = await createProjectInWorkspace(workspaceId, {
+    name: "Project detail fixture", description: "Only workspace members can read this", status: "active",
+  }, token);
+  expect(response.status).toBe(201);
+  return (await response.json()).data;
+}
+
+test.each(["owner", "editor", "viewer"] as const)("a %s can read another member's workspace project", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role === "owner" ? "editor" : role);
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const response = await getProject(workspaceId, project.id, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: project });
+});
+
+test("an outsider cannot read a project by knowing both resource IDs", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const response = await getProject(workspaceId, project.id, otherToken);
+  expect(response.status).toBe(404);
+  const body = await response.json();
+  expect(body.error.code).toBe("NOT_FOUND");
+  expect(body.data).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain(project.description);
+});
+
+test("project detail rejects mismatched workspace IDs even for an owner of both", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const created = await create({ name: "Different project workspace" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const response = await getProject(other.id, project.id, ownerToken);
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({ error: {
+    code: "NOT_FOUND", message: "Project not found",
+    requestId: response.headers.get("x-request-id"),
+  } });
+  expect(await workspaceProjects(workspaceId)).toHaveLength(1);
+});
+
+test("project detail authentication precedes validation", async () => {
+  const response = await getProject("invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("project detail returns 404 for missing workspace and missing project", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM projects WHERE id = 2147483647")).rows).toEqual([]);
+  for (const [wid, pid] of [[2147483647, project.id], [workspaceId, 2147483647]]) {
+    const response = await getProject(wid, pid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+});
+
+test("project detail validates both route IDs without modifying the project", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await getProject(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("a removed creator loses project detail access while the workspace keeps the project", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const before = await getProject(workspaceId, project.id, otherToken);
+  expect(before.status).toBe(200);
+  await before.json();
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+  const denied = await getProject(workspaceId, project.id, otherToken);
+  expect(denied.status).toBe(404);
+  expect((await denied.json()).error.code).toBe("NOT_FOUND");
+  const accessible = await getProject(workspaceId, project.id, ownerToken);
+  expect(accessible.status).toBe(200);
+  expect(await accessible.json()).toEqual({ data: project });
+});
+
+async function editProject(workspaceId: number | string, projectId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}`, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor"] as const)("an %s can update another member's project without changing ownership", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const response = await editProject(workspaceId, project.id, {
+    name: "  Updated project  ", description: "Updated description", status: "completed",
+    workspaceId: -1, workspace_id: -1, createdBy: -1, userId: -1, user_id: -1,
+  }, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: {
+    ...project, name: "Updated project", description: "Updated description", status: "completed",
+  } });
+  const [saved] = await workspaceProjects(workspaceId);
+  expect(saved).toMatchObject({
+    id: project.id, workspace_id: workspaceId, user_id: project.createdBy,
+    name: "Updated project", description: "Updated description", status: "completed",
+  });
+});
+
+test("partial project updates preserve omitted fields and null explicitly clears description", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const renamed = await editProject(workspaceId, project.id, { name: "Renamed project" }, ownerToken);
+  expect(renamed.status).toBe(200);
+  expect(await renamed.json()).toEqual({ data: { ...project, name: "Renamed project" } });
+  const cleared = await editProject(workspaceId, project.id, { description: null }, ownerToken);
+  expect(cleared.status).toBe(200);
+  const expected = { ...project, name: "Renamed project", description: null };
+  expect(await cleared.json()).toEqual({ data: expected });
+  const completed = await editProject(workspaceId, project.id, { status: "completed" }, ownerToken);
+  expect(completed.status).toBe(200);
+  expect(await completed.json()).toEqual({ data: { ...expected, status: "completed" } });
+  expect((await workspaceProjects(workspaceId))[0]).toMatchObject({
+    name: "Renamed project", description: null, status: "completed",
+  });
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot update workspace projects", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const response = await editProject(workspaceId, project.id, { status: "completed" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("project updates require authentication before validation", async () => {
+  const response = await editProject("invalid", "invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("project updates reject mismatched and missing resource IDs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const created = await create({ name: "Other update team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const before = await workspaceProjects(workspaceId);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM projects WHERE id = 2147483647")).rows).toEqual([]);
+  for (const [wid, pid] of [[other.id, project.id], [2147483647, project.id], [workspaceId, 2147483647]]) {
+    const response = await editProject(wid, pid, { status: "completed" }, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test.each([{}, { workspaceId: 123, createdBy: 123 }])("an update with no editable fields returns 422: %j", async (body) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const response = await editProject(workspaceId, project.id, body, ownerToken);
+  expect(response.status).toBe(422);
+  expect((await response.json()).error.code).toBe("EMPTY_UPDATE");
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("project updates validate both IDs and supplied field values", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await editProject(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id, { status: "completed" }, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  for (const [field, value] of [
+    ["name", null], ["name", ""], ["name", "   "], ["name", "ab"],
+    ["name", "x".repeat(101)], ["name", 123],
+    ["description", "x".repeat(256)], ["description", 123],
+    ["status", "unknown"], ["status", null],
+  ] as const) {
+    const response = await editProject(workspaceId, project.id, { [field]: value }, ownerToken);
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    if (value === null) {
+      // Vine treats null on optional, non-nullable fields as omitted.
+      expect(body.error.code).toBe("EMPTY_UPDATE");
+    } else {
+      expect(body.errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("a failed project update leaves every project field unchanged", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const constraint = `project_update_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(
+      `ALTER TABLE projects ADD CONSTRAINT ${constraint} CHECK (id <> ${project.id} OR status <> 'completed') NOT VALID`,
+    );
+    const response = await editProject(workspaceId, project.id, {
+      name: "Rejected rename", description: null, status: "completed",
+    }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE projects DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["demoted", "removed"])("a waiting project update rechecks access after its editor is %s", async (change) => {
+  const { workspaceId, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const before = await workspaceProjects(workspaceId);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = editProject(workspaceId, project.id, { status: "completed" }, otherToken);
+    void pending.catch(() => {});
+    let blocked = false;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const waiting = await pool!.query(
+        `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+         AND $1::int = ANY(pg_blocking_pids(pid))) AS blocked`, [pid.rows[0].pid],
+      );
+      if (waiting.rows[0].blocked) { blocked = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(blocked).toBe(true);
+    await locker.query(
+      change === "demoted"
+        ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2"
+        : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+      [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    expect((await response.json()).error.code).toBe(change === "demoted" ? "FORBIDDEN" : "NOT_FOUND");
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+async function deleteProjectInWorkspace(workspaceId: number | string, projectId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}`, {
+    method: "DELETE",
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function waitForDatabaseBlocker(pid: number) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const waiting = await pool!.query(
+      `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database()
+       AND $1::int = ANY(pg_blocking_pids(pid))) AS blocked`, [pid],
+    );
+    if (waiting.rows[0].blocked) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("Expected request to wait for the test transaction's lock");
+}
+
+test("the owner can delete an editor's empty project without deleting another project", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const target = await projectFixtureForHttp(workspaceId, otherToken);
+  const kept = await projectFixtureForHttp(workspaceId, ownerToken);
+  const memberships = await membershipSnapshot(workspaceId);
+  const response = await deleteProjectInWorkspace(workspaceId, target.id, ownerToken);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect((await workspaceProjects(workspaceId)).map((row) => row.id)).toEqual([kept.id]);
+  expect(await membershipSnapshot(workspaceId)).toEqual(memberships);
+  const repeated = await deleteProjectInWorkspace(workspaceId, target.id, ownerToken);
+  expect(repeated.status).toBe(404);
+  expect((await repeated.json()).error.code).toBe("NOT_FOUND");
+});
+
+test.each(["editor", "viewer", "outsider"] as const)("an %s cannot delete workspace projects", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  // Even a project creator must currently have owner authority to delete it.
+  const project = await projectFixtureForHttp(workspaceId, role === "editor" ? otherToken : ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const response = await deleteProjectInWorkspace(workspaceId, project.id, otherToken);
+  expect(response.status).toBe(role === "outsider" ? 404 : 403);
+  expect((await response.json()).error.code).toBe(role === "outsider" ? "NOT_FOUND" : "FORBIDDEN");
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("deletion of a project containing tasks returns 409 and preserves all records", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const inserted = await pool!.query(
+    "INSERT INTO tasks (project_id, title) VALUES ($1, 'Preserved task') RETURNING *", [project.id],
+  );
+  const before = await workspaceProjects(workspaceId);
+  const response = await deleteProjectInWorkspace(workspaceId, project.id, ownerToken);
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: {
+    code: "PROJECT_NOT_EMPTY", message: "Remove the project's tasks before deleting it",
+    requestId: response.headers.get("x-request-id"),
+  } });
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+  expect((await pool!.query("SELECT * FROM tasks WHERE project_id = $1", [project.id])).rows)
+    .toEqual(inserted.rows);
+});
+
+test("project deletion rejects mismatched workspaces and missing resources", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const created = await create({ name: "Other deletion workspace" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const before = await workspaceProjects(workspaceId);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM projects WHERE id = 2147483647")).rows).toEqual([]);
+  for (const [wid, pid] of [[other.id, project.id], [workspaceId, 2147483647], [2147483647, project.id]]) {
+    const response = await deleteProjectInWorkspace(wid, pid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("project deletion validates both route IDs without changing records", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await deleteProjectInWorkspace(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("project deletion requires authentication before validating IDs", async () => {
+  const response = await deleteProjectInWorkspace("invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("concurrent deletions delete one project and return 404 to the later request", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const responses = await Promise.all([
+    deleteProjectInWorkspace(workspaceId, project.id, ownerToken),
+    deleteProjectInWorkspace(workspaceId, project.id, ownerToken),
+  ]);
+  expect(responses.map((response) => response.status).sort()).toEqual([204, 404]);
+  await Promise.all(responses.map((response) => response.text()));
+  expect(await workspaceProjects(workspaceId)).toEqual([]);
+});
+
+test.each(["demoted", "removed"])("a waiting deletion rechecks authority after its owner is %s", async (change) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = deleteProjectInWorkspace(workspaceId, project.id, ownerToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid.rows[0].pid);
+    // Transfer ownership first, then optionally remove the former owner.
+    await locker.query("UPDATE workspace_members SET role = 'editor' WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[0]]);
+    await locker.query("UPDATE workspace_members SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]]);
+    if (change === "removed") {
+      await locker.query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[0]]);
+    }
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+test("the foreign key protects a task inserted by a legacy writer during project deletion", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const writer = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await writer.query("BEGIN");
+    const pid = await writer.query("SELECT pg_backend_pid() AS pid");
+    // Uncommitted task is invisible to projectHasTasks, but blocks deletion.
+    const inserted = await writer.query(
+      "INSERT INTO tasks (project_id, title) VALUES ($1, 'Concurrent legacy task') RETURNING id", [project.id],
+    );
+    pending = deleteProjectInWorkspace(workspaceId, project.id, ownerToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid.rows[0].pid);
+    await writer.query("COMMIT");
+    const response = await pending;
+    // The user chose to leave the optional 409 translation commented out.
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      success: false, message: "Internal server error", requestId: response.headers.get("x-request-id"),
+    });
+    expect((await workspaceProjects(workspaceId)).map((row) => row.id)).toEqual([project.id]);
+    expect((await pool!.query("SELECT id FROM tasks WHERE project_id = $1", [project.id])).rows)
+      .toEqual(inserted.rows);
+  } finally {
+    try { await writer.query("ROLLBACK"); } finally { writer.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+test("legacy project URLs cannot create personal or workspace projects", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const path of ["/users/projects", `/users/projects/${workspaceId}/projects`]) {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ownerToken}` },
+      body: JSON.stringify({ name: "Legacy creation attempt", status: "active", workspaceId }),
+      signal: AbortSignal.timeout(5000),
+    });
+    expect(response.status).toBe(404);
+    await response.text();
+  }
+  expect((await pool!.query(
+    "SELECT id FROM projects WHERE user_id = ANY($1::int[])", [userIds],
+  )).rows).toEqual([]);
+
+  const created = await createProjectInWorkspace(workspaceId, {
+    name: "Workspace-only project", status: "active",
+  }, ownerToken);
+  expect(created.status).toBe(201);
+  expect((await created.json()).data.workspaceId).toBe(workspaceId);
+  expect(await workspaceProjects(workspaceId)).toHaveLength(1);
+});
+
+test("a removed creator cannot bypass workspace checks through retired project or task routes", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const tasks = await pool!.query(
+    "INSERT INTO tasks (project_id, title) VALUES ($1, 'Workspace-isolated task') RETURNING *", [project.id],
+  );
+  const taskId = tasks.rows[0].id;
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+  const projects = await workspaceProjects(workspaceId);
+  for (const [method, path] of [
+    ["GET", "/users/projects"],
+    ["GET", `/users/projects/${project.id}`],
+    ["PATCH", `/users/projects/${project.id}`],
+    ["DELETE", `/users/projects/${project.id}`],
+    ["GET", `/projects/${project.id}/tasks`],
+    ["GET", `/projects/${project.id}/tasks/${taskId}`],
+    ["POST", `/projects/${project.id}/tasks`],
+    ["PATCH", `/projects/${project.id}/tasks/${taskId}`],
+    ["DELETE", `/projects/${project.id}/tasks/${taskId}`],
+  ] as const) {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method, headers: { authorization: `Bearer ${otherToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await workspaceProjects(workspaceId)).toEqual(projects);
+  expect((await pool!.query("SELECT * FROM tasks WHERE id = $1", [taskId])).rows).toEqual(tasks.rows);
+  const denied = await getProject(workspaceId, project.id, otherToken);
+  expect(denied.status).toBe(404);
+  await denied.json();
+  const allowed = await getProject(workspaceId, project.id, ownerToken);
+  expect(allowed.status).toBe(200);
+  expect(await allowed.json()).toEqual({ data: project });
+});
+
+async function listProjectTasks(workspaceId: number | string, projectId: number | string, token?: string, cursor?: string) {
+  const url = new URL(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/tasks`);
+  if (cursor !== undefined) url.searchParams.set("afterId", cursor);
+  return fetch(url, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function insertTaskFixture(projectId: number, title = "Workspace task fixture") {
+  const result = await pool!.query(
+    "INSERT INTO tasks (project_id, title, description, status) VALUES ($1, $2, 'Task description', 'on progress') RETURNING *",
+    [projectId, title],
+  );
+  return result.rows[0];
+}
+
+test.each(["owner", "editor", "viewer"] as const)("a workspace %s can read project tasks with task-specific fields", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role === "owner" ? "editor" : role);
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const response = await listProjectTasks(workspaceId, project.id, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [{
+    id: task.id, projectId: project.id, title: task.title, description: task.description,
+    status: task.status, createdAt: task.created_at.toISOString(),
+  }], page: { nextCursor: null } });
+});
+
+test("task lists are scoped to both project and workspace, even for a member of both", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const visible = await insertTaskFixture(project.id, "Visible task");
+  await insertTaskFixture(sibling.id, "Sibling project task");
+  const created = await create({ name: "Separate task workspace" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  await insertTaskFixture(otherProject.id, "Other workspace task");
+
+  const response = await listProjectTasks(workspaceId, project.id, ownerToken);
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.data).toEqual([expect.objectContaining({ id: visible.id, title: "Visible task" })]);
+  expect(body.page.nextCursor).toBeNull();
+  for (const [wid, pid] of [[workspaceId, otherProject.id], [other.id, project.id]]) {
+    const mismatch = await listProjectTasks(wid, pid, ownerToken);
+    expect(mismatch.status).toBe(404);
+    expect((await mismatch.json()).error.code).toBe("NOT_FOUND");
+  }
+});
+
+test("a project without tasks returns an empty task page", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const response = await listProjectTasks(workspaceId, project.id, ownerToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test.each([20, 21])("task pagination handles %i records without duplicates or omissions", async (count) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const inserted = await pool!.query(
+    `INSERT INTO tasks (project_id, title) SELECT $1, 'Task ' || n::text
+     FROM generate_series(1, $2::int) AS n RETURNING id`, [project.id, count],
+  );
+  const ids: number[] = inserted.rows.map((row) => row.id).sort((a, b) => a - b);
+  const firstResponse = await listProjectTasks(workspaceId, project.id, ownerToken, "0");
+  expect(firstResponse.status).toBe(200);
+  const first = await firstResponse.json();
+  expect(first.data.map((task: { id: number }) => task.id)).toEqual(ids.slice(0, 20));
+  expect(first.page.nextCursor).toBe(count === 21 ? ids[19] : null);
+  if (count === 21) {
+    const secondResponse = await listProjectTasks(workspaceId, project.id, ownerToken, String(first.page.nextCursor));
+    expect(secondResponse.status).toBe(200);
+    const second = await secondResponse.json();
+    expect(second.data.map((task: { id: number }) => task.id)).toEqual(ids.slice(20));
+    expect(second.page.nextCursor).toBeNull();
+  }
+  const beyond = await listProjectTasks(workspaceId, project.id, ownerToken, "2147483647");
+  expect(beyond.status).toBe(200);
+  expect(await beyond.json()).toEqual({ data: [], page: { nextCursor: null } });
+});
+
+test("outsiders cannot list tasks by knowing workspace and project IDs", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  await insertTaskFixture(project.id, "Private workspace task");
+  const response = await listProjectTasks(workspaceId, project.id, otherToken);
+  expect(response.status).toBe(404);
+  const body = await response.json();
+  expect(body.error.code).toBe("NOT_FOUND");
+  expect(body.data).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain("Private workspace task");
+});
+
+test("task listing requires authentication before validating route IDs", async () => {
+  const response = await listProjectTasks("invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("missing workspace or project returns 404 instead of an empty task page", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM projects WHERE id = 2147483647")).rows).toEqual([]);
+  for (const [wid, pid] of [[workspaceId, 2147483647], [2147483647, project.id]]) {
+    const response = await listProjectTasks(wid, pid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+});
+
+test("task listing validates workspace/project IDs and pagination cursors", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await listProjectTasks(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  for (const invalid of ["abc", "-1", "1.5", "2147483648"]) {
+    const response = await listProjectTasks(workspaceId, project.id, ownerToken, invalid);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "afterId" }),
+    ]));
+  }
+});
+
+test("removed project creators lose task-list access with their existing token", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await listProjectTasks(workspaceId, project.id, otherToken);
+  expect(before.status).toBe(200);
+  await before.json();
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+  const denied = await listProjectTasks(workspaceId, project.id, otherToken);
+  expect(denied.status).toBe(404);
+  expect((await denied.json()).error.code).toBe("NOT_FOUND");
+  const accessible = await listProjectTasks(workspaceId, project.id, ownerToken);
+  expect(accessible.status).toBe(200);
+  expect((await accessible.json()).data).toEqual([expect.objectContaining({ id: task.id })]);
+});
+
+async function getTask(workspaceId: number | string, projectId: number | string, taskId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/tasks/${taskId}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+function taskResponse(task: { id: number; project_id: number; title: string; description: string | null; status: string | null; created_at: Date }) {
+  return {
+    id: task.id, projectId: task.project_id, title: task.title,
+    description: task.description, status: task.status, createdAt: task.created_at.toISOString(),
+  };
+}
+
+test.each(["owner", "editor", "viewer"] as const)("a %s can read a workspace task with the task's own fields", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role === "owner" ? "editor" : role);
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const response = await getTask(workspaceId, project.id, task.id, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: taskResponse(task) });
+});
+
+test("outsiders cannot retrieve task details with known workspace, project, and task IDs", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id, "Private task details");
+  const response = await getTask(workspaceId, project.id, task.id, otherToken);
+  expect(response.status).toBe(404);
+  const body = await response.json();
+  expect(body.error.code).toBe("NOT_FOUND");
+  expect(body.data).toBeUndefined();
+  expect(JSON.stringify(body)).not.toContain(task.title);
+});
+
+test("task detail rejects mismatched project/workspace/task combinations", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const siblingTask = await insertTaskFixture(sibling.id);
+  const created = await create({ name: "Another task detail team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  const otherTask = await insertTaskFixture(otherProject.id);
+  for (const [wid, pid, tid] of [
+    [workspaceId, sibling.id, task.id], [workspaceId, project.id, siblingTask.id],
+    [other.id, project.id, task.id], [workspaceId, otherProject.id, otherTask.id],
+    [workspaceId, project.id, otherTask.id],
+  ]) {
+    const response = await getTask(wid, pid, tid, ownerToken);
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body.error.code).toBe("NOT_FOUND");
+    expect(body.data).toBeUndefined();
+  }
+});
+
+test("task detail requires authentication before route validation", async () => {
+  const response = await getTask("invalid", "invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("task detail returns 404 for each missing level of the resource hierarchy", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  for (const table of ["workspaces", "projects", "tasks"]) {
+    expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  }
+  for (const [wid, pid, tid] of [
+    [2147483647, project.id, task.id], [workspaceId, 2147483647, task.id], [workspaceId, project.id, 2147483647],
+  ]) {
+    const response = await getTask(wid, pid, tid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+});
+
+test("task detail validates all three route IDs without changing records", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid", "tid"]) {
+      const response = await getTask(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id,
+        field === "tid" ? invalid : task.id, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ field }),
+      ]));
+    }
+  }
+  expect((await pool!.query("SELECT * FROM tasks WHERE id = $1", [task.id])).rows).toEqual([task]);
+});
+
+test("removed creators lose task-detail access, while the owner retains access", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await getTask(workspaceId, project.id, task.id, otherToken);
+  expect(before.status).toBe(200);
+  await before.json();
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+  const denied = await getTask(workspaceId, project.id, task.id, otherToken);
+  expect(denied.status).toBe(404);
+  expect((await denied.json()).error.code).toBe("NOT_FOUND");
+  const allowed = await getTask(workspaceId, project.id, task.id, ownerToken);
+  expect(allowed.status).toBe(200);
+  expect(await allowed.json()).toEqual({ data: taskResponse(task) });
+});
+
+async function createTaskInWorkspace(workspaceId: number | string, projectId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/tasks`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function savedProjectTasks(projectId: number) {
+  return (await pool!.query("SELECT * FROM tasks WHERE project_id = $1 ORDER BY id", [projectId])).rows;
+}
+
+test.each(["owner", "editor"] as const)("a workspace %s can create a task without spoofing its project", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const response = await createTaskInWorkspace(workspaceId, project.id, {
+    title: "  Shared task  ", description: "Task content", status: "on progress",
+    projectId: -1, project_id: -1, workspaceId: -1, createdBy: -1, userId: -1,
+  }, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(201);
+  const [task] = await savedProjectTasks(project.id);
+  expect(await response.json()).toEqual({ data: taskResponse(task) });
+  expect(task).toMatchObject({ project_id: project.id, title: "Shared task", description: "Task content", status: "on progress" });
+  const after = await workspaceProjects(workspaceId);
+  expect(BigInt(after[0].task_cache_version)).toBe(BigInt(before[0].task_cache_version) + 1n);
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot create workspace tasks", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const response = await createTaskInWorkspace(workspaceId, project.id, { title: "Forbidden task", status: "done" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedProjectTasks(project.id)).toEqual([]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("task creation rejects another workspace's project and missing resources", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const created = await create({ name: "Other task creation team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  expect((await pool!.query("SELECT id FROM workspaces WHERE id = 2147483647")).rows).toEqual([]);
+  expect((await pool!.query("SELECT id FROM projects WHERE id = 2147483647")).rows).toEqual([]);
+  for (const [wid, pid] of [[other.id, project.id], [2147483647, project.id], [workspaceId, 2147483647]]) {
+    const response = await createTaskInWorkspace(wid, pid, { title: "Wrong project task", status: "done" }, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([]);
+});
+
+test("workspace task creation requires authentication before validation", async () => {
+  const response = await createTaskInWorkspace("invalid", "invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("task creation supports each valid status, optional descriptions, and exact column limits", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  for (const status of ["done", "cancelled", "on progress"]) {
+    const response = await createTaskInWorkspace(workspaceId, project.id, { title: `Task ${status}`, status }, ownerToken);
+    expect(response.status).toBe(201);
+    expect((await response.json()).data).toMatchObject({ projectId: project.id, status, description: null });
+  }
+  const response = await createTaskInWorkspace(workspaceId, project.id, {
+    title: "x".repeat(50), description: "x".repeat(255), status: "done",
+  }, ownerToken);
+  expect(response.status).toBe(201);
+  expect((await response.json()).data).toMatchObject({ title: "x".repeat(50), description: "x".repeat(255) });
+  expect(await savedProjectTasks(project.id)).toHaveLength(4);
+});
+
+test("task creation validates IDs and content without creating rows or changing cache versions", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await createTaskInWorkspace(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id, { title: "Valid task", status: "done" }, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  for (const [field, value] of [
+    ["title", undefined], ["title", null], ["title", ""], ["title", "   "],
+    ["title", "ab"], ["title", "x".repeat(51)], ["title", 123],
+    ["description", "x".repeat(256)], ["description", 123],
+    ["status", undefined], ["status", null], ["status", "active"],
+  ] as const) {
+    const response = await createTaskInWorkspace(workspaceId, project.id, { title: "Valid task", status: "done", [field]: value }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("failed task insertion rolls back without changing the project's cache version", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const constraint = `task_create_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(`ALTER TABLE tasks ADD CONSTRAINT ${constraint} CHECK (project_id <> ${project.id}) NOT VALID`);
+    const response = await createTaskInWorkspace(workspaceId, project.id, { title: "Rejected task", status: "done" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedProjectTasks(project.id)).toEqual([]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["demoted", "removed"])("waiting task creation rechecks membership after its editor is %s", async (change) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = createTaskInWorkspace(workspaceId, project.id, { title: "Stale permission task", status: "done" }, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid.rows[0].pid);
+    await locker.query(
+      change === "demoted"
+        ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2"
+        : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+      [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await savedProjectTasks(project.id)).toEqual([]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+async function editTask(workspaceId: number | string, projectId: number | string, taskId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/tasks/${taskId}`, {
+    method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor"] as const)("an %s can update a task without changing its project", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const response = await editTask(workspaceId, project.id, task.id, {
+    title: "  Updated task  ", description: "Updated task content", status: "done",
+    projectId: -1, project_id: -1, workspaceId: -1, id: -1,
+  }, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: {
+    ...taskResponse(task), title: "Updated task", description: "Updated task content", status: "done",
+  } });
+  expect(await savedProjectTasks(project.id)).toEqual([
+    { ...task, title: "Updated task", description: "Updated task content", status: "done" },
+  ]);
+  const after = await workspaceProjects(workspaceId);
+  expect(BigInt(after[0].task_cache_version)).toBe(BigInt(before[0].task_cache_version) + 1n);
+});
+
+test("partial task updates preserve omitted fields and clear descriptions with null", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const renamed = await editTask(workspaceId, project.id, task.id, { title: "Renamed task" }, ownerToken);
+  expect(renamed.status).toBe(200);
+  expect(await renamed.json()).toEqual({ data: { ...taskResponse(task), title: "Renamed task" } });
+  const cleared = await editTask(workspaceId, project.id, task.id, { description: null }, ownerToken);
+  expect(cleared.status).toBe(200);
+  const expected = { ...taskResponse(task), title: "Renamed task", description: null };
+  expect(await cleared.json()).toEqual({ data: expected });
+  for (const status of ["done", "cancelled", "on progress"]) {
+    const response = await editTask(workspaceId, project.id, task.id, { status }, ownerToken);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: { ...expected, status } });
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([
+    { ...task, title: "Renamed task", description: null, status: "on progress" },
+  ]);
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot update workspace tasks", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const response = await editTask(workspaceId, project.id, task.id, { status: "done" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("task updates require authentication before validation", async () => {
+  const response = await editTask("invalid", "invalid", "invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("task updates reject mismatched hierarchy and missing resources without changing records", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const created = await create({ name: "Other task update team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const table of ["workspaces", "projects", "tasks"]) {
+    expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  }
+  for (const [wid, pid, tid] of [
+    [workspaceId, sibling.id, task.id], [other.id, project.id, task.id],
+    [workspaceId, otherProject.id, task.id], [2147483647, project.id, task.id],
+    [workspaceId, 2147483647, task.id], [workspaceId, project.id, 2147483647],
+  ]) {
+    const response = await editTask(wid, pid, tid, { status: "done" }, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test.each([{}, { projectId: 123, workspaceId: 123 }])("task updates require editable fields: %j", async (body) => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const response = await editTask(workspaceId, project.id, task.id, body, ownerToken);
+  expect(response.status).toBe(422);
+  expect((await response.json()).error.code).toBe("EMPTY_UPDATE");
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+});
+
+test("task updates validate all route IDs and field limits without changing cache versions", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid", "tid"]) {
+      const response = await editTask(
+        field === "wid" ? invalid : workspaceId, field === "pid" ? invalid : project.id,
+        field === "tid" ? invalid : task.id, { status: "done" }, ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  for (const [field, value] of [
+    ["title", null], ["title", ""], ["title", "   "], ["title", "ab"],
+    ["title", "x".repeat(51)], ["title", 123],
+    ["description", "x".repeat(256)], ["description", 123],
+    ["status", null], ["status", "active"],
+  ] as const) {
+    const response = await editTask(workspaceId, project.id, task.id, { [field]: value }, ownerToken);
+    expect(response.status).toBe(422);
+    const body = await response.json();
+    if (value === null) expect(body.error.code).toBe("EMPTY_UPDATE");
+    else expect(body.errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("failed task updates roll back content and cache-version changes", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const constraint = `task_update_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(`ALTER TABLE tasks ADD CONSTRAINT ${constraint} CHECK (id <> ${task.id} OR status <> 'done') NOT VALID`);
+    const response = await editTask(workspaceId, project.id, task.id, { title: "Rejected edit", description: null, status: "done" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedProjectTasks(project.id)).toEqual([task]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE tasks DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["demoted", "removed"])("a waiting task update rechecks permission after its editor is %s", async (change) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = editTask(workspaceId, project.id, task.id, { status: "done" }, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid.rows[0].pid);
+    await locker.query(
+      change === "demoted" ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2"
+        : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await savedProjectTasks(project.id)).toEqual([task]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
+
+async function deleteTaskInWorkspace(
+  workspaceId: number | string,
+  projectId: number | string,
+  taskId: number | string,
+  token?: string,
+) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/tasks/${taskId}`, {
+    method: "DELETE",
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor"] as const)("an %s can delete a task while preserving its siblings and project", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, role === "owner" ? otherToken : ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const sibling = await insertTaskFixture(project.id, "Preserved sibling");
+  const before = await workspaceProjects(workspaceId);
+  const token = role === "owner" ? ownerToken : otherToken;
+  const response = await deleteTaskInWorkspace(workspaceId, project.id, task.id, token);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect(await savedProjectTasks(project.id)).toEqual([sibling]);
+  const after = await workspaceProjects(workspaceId);
+  expect(after).toHaveLength(1);
+  expect(after[0]).toEqual({ ...before[0], task_cache_version: (BigInt(before[0].task_cache_version) + 1n).toString() });
+
+  const repeated = await deleteTaskInWorkspace(workspaceId, project.id, task.id, token);
+  expect(repeated.status).toBe(404);
+  expect((await repeated.json()).error.code).toBe("NOT_FOUND");
+  expect(await workspaceProjects(workspaceId)).toEqual(after);
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot delete workspace tasks", async (role) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const response = await deleteTaskInWorkspace(workspaceId, project.id, task.id, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("task deletion requires authentication before validating IDs", async () => {
+  const response = await deleteTaskInWorkspace("invalid", "invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("task deletion rejects mismatched hierarchy and missing resources", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const created = await create({ name: "Other task deletion team" }, ownerToken);
+  expect(created.status).toBe(201);
+  const { data: other } = await created.json();
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  const before = await workspaceProjects(workspaceId);
+  for (const table of ["workspaces", "projects", "tasks"]) {
+    expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  }
+  for (const [wid, pid, tid] of [
+    [workspaceId, sibling.id, task.id], [other.id, project.id, task.id],
+    [workspaceId, otherProject.id, task.id], [2147483647, project.id, task.id],
+    [workspaceId, 2147483647, task.id], [workspaceId, project.id, 2147483647],
+  ]) {
+    const response = await deleteTaskInWorkspace(wid, pid, tid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("task deletion validates all three route IDs without changing records", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid", "tid"]) {
+      const response = await deleteTaskInWorkspace(
+        field === "wid" ? invalid : workspaceId,
+        field === "pid" ? invalid : project.id,
+        field === "tid" ? invalid : task.id,
+        ownerToken,
+      );
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  expect(await savedProjectTasks(project.id)).toEqual([task]);
+  expect(await workspaceProjects(workspaceId)).toEqual(before);
+});
+
+test("a failed cache-version update rolls back task deletion", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const constraint = `task_delete_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    // Force the deletion trigger to fail after DELETE, proving both changes roll back.
+    await pool!.query(`ALTER TABLE projects ADD CONSTRAINT ${constraint} CHECK (id <> ${project.id} OR task_cache_version <= ${BigInt(before[0].task_cache_version)}) NOT VALID`);
+    const response = await deleteTaskInWorkspace(workspaceId, project.id, task.id, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedProjectTasks(project.id)).toEqual([task]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE projects DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test.each(["demoted", "removed"])("a waiting task deletion rechecks permission after its editor is %s", async (change) => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const task = await insertTaskFixture(project.id);
+  const before = await workspaceProjects(workspaceId);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = await locker.query("SELECT pg_backend_pid() AS pid");
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = deleteTaskInWorkspace(workspaceId, project.id, task.id, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid.rows[0].pid);
+    await locker.query(
+      change === "demoted" ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2"
+        : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]],
+    );
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    expect((await response.json()).error.code).toBe(change === "demoted" ? "FORBIDDEN" : "NOT_FOUND");
+    expect(await savedProjectTasks(project.id)).toEqual([task]);
+    expect(await workspaceProjects(workspaceId)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then((response) => response.text()).catch(() => {});
+  }
+});
 
 test("lists only the authenticated user's workspaces", async () => {
   const token = await login();

@@ -1,6 +1,14 @@
 import express, { type Request, type Response, type Express } from "express";
 import * as taskRepository from "../repositories/task.repository.ts";
 import { getCachedTasks } from "../services/task-cache.service.ts";
+import { AppError } from "../shared/app-error.ts";
+import {
+  createWorkspaceTask,
+  editWorkspaceTask,
+  getWorkspaceTask,
+  listWorkspaceTasks,
+  removeWorkspaceTask,
+} from "../services/tasks.service.ts";
 
 const get_tasks = async (req: Request, res: Response) => {
   if (!req.user || typeof req.user === "string") {
@@ -43,12 +51,7 @@ const create_task = async (req: Request, res: Response) => {
     });
   }
 
-  await taskRepository.insertTask(
-    title,
-    description,
-    status,
-    projectId,
-  );
+  await taskRepository.insertTask(title, description, status, projectId);
   res.status(201).json({ message: "Task is successfully created" });
 };
 
@@ -81,11 +84,137 @@ const delete_task = async (req: Request, res: Response) => {
   const userId = req.user.userId;
   const projectId = req.params.project_id;
   const taskId = req.params.task_id;
-  const deleted = await taskRepository.deleteTaskForUser(userId, projectId, taskId);
+  const deleted = await taskRepository.deleteTaskForUser(
+    userId,
+    projectId,
+    taskId,
+  );
   if (!deleted) {
     return res.status(404).json({ message: "Task not found" });
   }
   res.status(200).json("task is deleted");
 };
+
+export async function listWorkspaceTasksController(
+  req: Request,
+  res: Response,
+) {
+  const userId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, pid } = res.locals.validatedParams;
+  const { afterId = 0 } = res.locals.validatedData;
+
+  const result = await listWorkspaceTasks(wid, pid, userId, afterId);
+
+  return res.status(200).json({
+    data: result.data,
+    page: { nextCursor: result.nextCursor },
+  });
+}
+
+export async function getWorkspaceTaskController(req: Request, res: Response) {
+  const userId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, pid, tid } = res.locals.validatedParams;
+  const task = await getWorkspaceTask(wid, pid, tid, userId);
+
+  return res.status(200).json({ data: task });
+}
+
+export async function createWorkspaceTaskController(
+  req: Request,
+  res: Response,
+) {
+  const actorId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, pid } = res.locals.validatedParams;
+  const { title, description, status } = res.locals.validatedData;
+
+  const task = await createWorkspaceTask(wid, pid, actorId, {
+    title,
+    description,
+    status,
+  });
+
+  return res.status(201).json({ data: task });
+}
+
+export async function editWorkspaceTaskController(req: Request, res: Response) {
+  const actorId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, pid, tid } = res.locals.validatedParams;
+  const { title, description, status } = res.locals.validatedData;
+
+  const task = await editWorkspaceTask(wid, pid, tid, actorId, {
+    title,
+    description,
+    status,
+  });
+
+  return res.status(200).json({ data: task });
+}
+
+export async function removeWorkspaceTaskController(
+  req: Request,
+  res: Response,
+) {
+  const actorId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof actorId !== "number" ||
+    !Number.isInteger(actorId) ||
+    actorId <= 0 ||
+    actorId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { wid, pid, tid } = res.locals.validatedParams;
+
+  await removeWorkspaceTask(wid, pid, tid, actorId);
+
+  return res.status(204).send();
+}
 
 export { get_tasks, get_task_by_Id, create_task, update_task, delete_task };

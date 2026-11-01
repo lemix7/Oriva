@@ -23,6 +23,14 @@ jest.unstable_mockModule("../repositories/project.repository.js", () => ({
   updateProject,
   deleteProject,
 }));
+// The legacy controllers share a module with the new workspace handler.
+jest.unstable_mockModule("../services/projects.service.js", () => ({
+  createWorkspaceProject: jest.fn(),
+  listWorkspaceProjects: jest.fn(),
+  getWorkspaceProject: jest.fn(),
+  editWorkspaceProject: jest.fn(),
+  removeWorkspaceProject: jest.fn(),
+}));
 const {
   get_projects,
   get_project_by_ID,
