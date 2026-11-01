@@ -7,7 +7,7 @@ A project and task management REST API built with Express, TypeScript, and Postg
 - User registration with bcrypt password hashing and optional profile pictures.
 - JWT authentication with tokens that expire after one hour.
 - Create, read, update, and delete projects and tasks.
-- Project and task queries scoped to the authenticated project owner.
+- Project and task access scoped to workspace membership and roles.
 - Request body validation with VineJS.
 - Profile uploads limited to 5 MB, stored in S3.
 - Background registration notification emails using a Redis-backed queue.
@@ -130,15 +130,15 @@ These endpoints require authentication but currently do not enforce per-user own
 - `DELETE /workspaces/:wid/projects/:pid` — deletes an empty project; requires owner membership.
 
 Project creation is available only through the workspace endpoint. The former
-`POST /users/projects` endpoint is removed and returns 404. Database
-`workspace_id` remains nullable temporarily for legacy records and fixtures.
+`POST /users/projects` endpoint is removed and returns 404. Migration
+`0005_require-project-workspace` makes `projects.workspace_id` required.
+Before applying it to an existing database, assign any projects with a null
+`workspace_id` to an appropriate workspace.
 
 ### Retired project endpoints
 
 All `/users/projects` routes are retired and return 404 for authenticated
 requests. Read and modify projects only through `/workspaces/:wid/projects`.
-Records without a workspace remain stored but are not exposed through HTTP;
-their database backfill and the non-null constraint are still pending.
 
 Project creation accepts `name` (at least 3 characters), optional `description`, and `status`: `active`, `inactive`, `pending`, or `completed`.
 
@@ -157,7 +157,9 @@ Viewers can read tasks but cannot create, update, or delete them.
 The legacy `/projects/:project_id/tasks` routes are retired and return 404 for
 authenticated requests. Their creator-only authorization could bypass workspace
 membership, including after member removal. Existing tasks remain stored.
-The old controllers and repositories remain for the migration.
+The retired controllers, repository functions, and creator-only task cache have
+been removed. Redis is still used for email jobs; database cache-version
+triggers remain in place.
 
 Send the token on protected requests:
 
@@ -314,11 +316,10 @@ shell cannot find it, first run `nvm use 22.23.2`.
 ## Drizzle repositories
 
 Project, task, and user repositories use the shared Drizzle client in
-`src/db/index.ts`, backed by the existing `pg` pool. Explicit projections retain
-the API's snake_case fields, and cache versions are serialized as strings.
-Task updates and deletes include the ownership check in the same SQL statement.
-Task reads retain the previous flat join response, including project values
-for column names shared by projects and tasks.
+`src/db/index.ts`, backed by the existing `pg` pool. Workspace project and task
+responses use explicit camelCase fields. Membership permissions are enforced
+in services, and mutations lock the workspace and check permissions inside the
+same transaction. Workspace task reads currently query PostgreSQL directly.
 
 The schema's custom date mappings reuse `pg` parsers so existing timestamps
 and date values keep their previous JavaScript types and timezone behavior.
@@ -327,21 +328,23 @@ The database schema and cache triggers are unchanged. Login uses the Drizzle-bac
 
 ## Local demo seed
 
-After applying both Drizzle migrations to an empty local `oriva_migration_test`
+After applying all Drizzle migrations to an empty local `oriva_migration_test`
 database, run `npm run db:seed`. The script reads `TEST_DATABASE_URL` from
 `.env.test` (an existing environment value takes priority), reuses its local
 credentials, and always targets `oriva_migration_test`. It refuses remote hosts.
 It does not create the database or run migrations.
 
 The seed creates a Demo Owner (`demo.owner@example.com`, local demo password
-`LocalDemo123!`), one active Demo Project, and two tasks: Plan the project (done)
+`LocalDemo123!`), one Demo Workspace with an owner membership, one active Demo
+Project linked to that workspace, and two tasks: Plan the project (done)
 and Build the first feature (on progress). The password is stored as a bcrypt
 hash. New projects/tasks use January 1, 2026 as their creation date. IDs remain
 database-generated.
 
 All inserts commit together or roll back on failure. A transaction-scoped lock
 serializes simultaneous seed runs. Reruns reuse demo records by email,
-owner/project name, and project/task title, preserving edits and passwords;
+creator/workspace name, workspace/creator/project name, and project/task title,
+preserving edits, existing membership roles, and passwords;
 missing demo records are recreated. Renaming those identifying fields makes
 the original demo record missing, so the next run recreates it. The script
 does not delete records, send email, access Redis/S3, or connect to Neon.

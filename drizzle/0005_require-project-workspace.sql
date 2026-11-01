@@ -1,0 +1,1 @@
+ALTER TABLE "projects" ALTER COLUMN "workspace_id" SET NOT NULL;
