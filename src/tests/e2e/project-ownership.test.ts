@@ -145,10 +145,16 @@ async function loginAs(email: string): Promise<string> {
   return body.token;
 }
 
-test("retired project and task routes deny both creators and outsiders without changing records", async () => {
+test("retired user, project, and task routes return 404 without changing records", async () => {
+  const usersBefore = await pool!.query("SELECT * FROM users WHERE id = ANY($1::int[]) ORDER BY id", [userIds]);
   const projectBefore = await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId]);
   const taskBefore = await pool!.query("SELECT * FROM tasks WHERE id = $1", [taskId]);
   const routes = [
+    ["GET", "/users"],
+    ["GET", `/users/${userBId}`],
+    ["PUT", `/users/${userBId}`],
+    ["PATCH", `/users/${userBId}`],
+    ["DELETE", `/users/${userBId}`],
     ["GET", "/users/projects"],
     ["POST", "/users/projects"],
     ["GET", `/users/projects/${projectId}`],
@@ -168,7 +174,7 @@ test("retired project and task routes deny both creators and outsiders without c
       const response = await fetch(`${baseUrl}${path}`, {
         method,
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        ...(method === "POST" || method === "PATCH"
+        ...(method === "POST" || method === "PATCH" || method === "PUT"
           ? { body: JSON.stringify({ name: "Unexpected project", title: "Unexpected task", status: "active" }) }
           : {}),
         signal: AbortSignal.timeout(5000),
@@ -183,6 +189,7 @@ test("retired project and task routes deny both creators and outsiders without c
 
   expect((await pool!.query("SELECT * FROM projects WHERE id = $1", [projectId])).rows).toEqual(projectBefore.rows);
   expect((await pool!.query("SELECT * FROM tasks WHERE id = $1", [taskId])).rows).toEqual(taskBefore.rows);
+  expect((await pool!.query("SELECT * FROM users WHERE id = ANY($1::int[]) ORDER BY id", [userIds])).rows).toEqual(usersBefore.rows);
   expect((await pool!.query("SELECT id FROM projects WHERE user_id = ANY($1::int[])", [userIds])).rows)
     .toEqual([{ id: projectId }]);
   expect((await pool!.query("SELECT id FROM tasks WHERE project_id = $1", [projectId])).rows)

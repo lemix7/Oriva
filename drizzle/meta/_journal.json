@@ -43,6 +43,13 @@
       "when": 1793539274114,
       "tag": "0005_require-project-workspace",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793634979034,
+      "tag": "0006_unique-user-email",
+      "breakpoints": true
     }
   ]
 }

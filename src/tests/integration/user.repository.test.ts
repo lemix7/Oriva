@@ -46,13 +46,11 @@ async function insertFixture() {
   return user;
 }
 
-test("user creation and reads retain the existing flat row shape", async () => {
+test("user creation persists the registration fields and supports login lookup", async () => {
   const user = await insertFixture();
   const previous = await pool!.query("SELECT * FROM users WHERE id = $1", [user.id]);
   expect(user).toEqual(previous.rows[0]);
   expect(user).toMatchObject({ role: "user", profile_pic_key: "avatars/test.png" });
-  expect(await repository.findUsersById(user.id)).toEqual(previous.rows);
-  expect(await repository.findUsersById(-1)).toEqual([]);
   expect(await repository.findUserByEmail(user.email!)).toEqual({
     id: user.id,
     password: user.password,
@@ -60,29 +58,101 @@ test("user creation and reads retain the existing flat row shape", async () => {
   expect(await repository.findUserByEmail("missing-user@test.local")).toBeNull();
 });
 
-test("user listing preserves all rows ordered by ID", async () => {
-  await insertFixture();
-  await insertFixture();
-  const previous = await pool!.query("SELECT * FROM users ORDER BY id ASC");
-  expect(await repository.findAllUsers()).toEqual(previous.rows);
-});
-
-test("user update reports affected rows and persists only the requested user", async () => {
+test("profile lookup returns only safe fields for the requested account", async () => {
   const user = await insertFixture();
   const other = await insertFixture();
-  expect(await repository.updateUser("Updated", "updated@test.local", user.id)).toBe(true);
-  expect(await repository.findUsersById(user.id)).toEqual([
-    { ...user, name: "Updated", email: "updated@test.local" },
-  ]);
-  expect(await repository.findUsersById(other.id)).toEqual([other]);
-  expect(await repository.updateUser("Missing", "missing@test.local", -1)).toBe(false);
+  expect(await repository.findUserProfileById(user.id)).toEqual({
+    id: user.id, name: user.name, email: user.email,
+  });
+  expect(await repository.findUserProfileById(other.id)).toEqual({
+    id: other.id, name: other.name, email: other.email,
+  });
 });
 
-test("user deletion reports affected rows and leaves the other user intact", async () => {
+test("profile lookup returns undefined for missing and deleted accounts", async () => {
+  expect(await repository.findUserProfileById(-1)).toBeUndefined();
+  const user = await insertFixture();
+  await pool!.query("DELETE FROM users WHERE id = $1", [user.id]);
+  expect(await repository.findUserProfileById(user.id)).toBeUndefined();
+});
+
+test("profile lookup preserves nullable profile fields", async () => {
+  const user = await insertFixture();
+  await pool!.query("UPDATE users SET name = NULL, email = NULL WHERE id = $1", [user.id]);
+  expect(await repository.findUserProfileById(user.id)).toEqual({
+    id: user.id, name: null, email: null,
+  });
+});
+
+test("profile updates persist safe fields only and leave other accounts unchanged", async () => {
   const user = await insertFixture();
   const other = await insertFixture();
-  expect(await repository.deleteUser(user.id)).toBe(true);
-  expect(await repository.findUsersById(user.id)).toEqual([]);
-  expect(await repository.findUsersById(other.id)).toEqual([other]);
-  expect(await repository.deleteUser(user.id)).toBe(false);
+  const changes = { name: "Updated profile", email: `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`, password: "ignored", role: "owner", id: other.id, profilePicKey: "ignored" };
+  expect(await repository.updateUserProfile(user.id, changes)).toEqual({ id: user.id, name: changes.name, email: changes.email });
+  const saved = await pool!.query("SELECT * FROM users WHERE id = $1", [user.id]);
+  const savedOther = await pool!.query("SELECT * FROM users WHERE id = $1", [other.id]);
+  expect(saved.rows).toEqual([{ ...user, name: changes.name, email: changes.email }]);
+  expect(savedOther.rows).toEqual([other]);
+});
+
+test("partial profile updates preserve omitted fields", async () => {
+  const user = await insertFixture();
+  expect(await repository.updateUserProfile(user.id, { name: "New profile name" })).toEqual({ id: user.id, name: "New profile name", email: user.email });
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`;
+  expect(await repository.updateUserProfile(user.id, { email })).toEqual({ id: user.id, name: "New profile name", email });
+});
+
+test("profile updates report no result for missing and deleted accounts", async () => {
+  expect(await repository.updateUserProfile(-1, { name: "New profile name" })).toBeUndefined();
+  const user = await insertFixture();
+  await pool!.query("DELETE FROM users WHERE id = $1", [user.id]);
+  expect(await repository.updateUserProfile(user.id, { name: "New profile name" })).toBeUndefined();
+});
+
+test("failed profile updates preserve both fields", async () => {
+  const user = await insertFixture();
+  await expect(repository.updateUserProfile(user.id, { name: "New profile name", email: "x".repeat(31) })).rejects.toThrow();
+  const saved = await pool!.query("SELECT * FROM users WHERE id = $1", [user.id]);
+  expect(saved.rows).toEqual([user]);
+});
+
+test("the email index rejects case and whitespace variants during registration", async () => {
+  const user = await insertFixture();
+  await expect(repository.insertUser("Duplicate account", ` ${user.email!.toUpperCase()} `, "test-only-hash", null))
+    .rejects.toMatchObject({ cause: { code: "23505", constraint: "users_email_unique" } });
+  const rows = await pool!.query("SELECT id FROM users WHERE lower(trim(email)) = $1", [user.email]);
+  expect(rows.rows).toEqual([{ id: user.id }]);
+});
+
+test("a duplicate-email profile edit rolls back every requested change", async () => {
+  const user = await insertFixture();
+  const other = await insertFixture();
+  const before = await pool!.query("SELECT * FROM users WHERE id = ANY($1::int[]) ORDER BY id", [[user.id, other.id]]);
+  await expect(repository.updateUserProfile(user.id, { name: "Rejected name", email: ` ${other.email!.toUpperCase()} ` }))
+    .rejects.toMatchObject({ cause: { code: "23505", constraint: "users_email_unique" } });
+  const after = await pool!.query("SELECT * FROM users WHERE id = ANY($1::int[]) ORDER BY id", [[user.id, other.id]]);
+  expect(after.rows).toEqual(before.rows);
+});
+
+test("a user can retain their own email while changing their name", async () => {
+  const user = await insertFixture();
+  expect(await repository.updateUserProfile(user.id, { name: "Same email owner", email: user.email! }))
+    .toEqual({ id: user.id, name: "Same email owner", email: user.email });
+});
+
+test("the migration normalizes existing emails before enforcing uniqueness", async () => {
+  const client = await pool!.connect();
+  try {
+    await client.query("BEGIN");
+    // Shadow users only on this connection; the real migration never touches public users.
+    await client.query("CREATE TEMP TABLE users (email varchar(30)) ON COMMIT DROP");
+    await client.query("INSERT INTO users VALUES ('  Alice@Example.COM  '), ('BOB@example.com'), (NULL)");
+    await client.query(readFileSync("drizzle/0006_unique-user-email.sql", "utf8"));
+    expect((await client.query("SELECT email FROM users ORDER BY email NULLS LAST")).rows)
+      .toEqual([{ email: "alice@example.com" }, { email: "bob@example.com" }, { email: null }]);
+    await expect(client.query("INSERT INTO users VALUES (' ALICE@EXAMPLE.COM ')"))
+      .rejects.toMatchObject({ code: "23505", constraint: "users_email_unique" });
+  } finally {
+    try { await client.query("ROLLBACK"); } finally { client.release(); }
+  }
 });

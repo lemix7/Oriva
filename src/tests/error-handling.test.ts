@@ -88,3 +88,27 @@ test("already-started responses delegate to Express without writing another resp
   expect(res.json).not.toHaveBeenCalled();
   expect(errorLog).not.toHaveBeenCalled();
 });
+
+test.each([false, true])("email conflicts return a safe 409 response (wrapped: %s)", wrapped => {
+  const databaseError = Object.assign(new Error("sensitive database detail"), {
+    code: "23505", constraint: "users_email_unique", detail: "private@example.com already exists",
+  });
+  const error = wrapped ? Object.assign(new Error("SQL parameters contain private values"), { cause: databaseError }) : databaseError;
+  const res = response();
+  const next = jest.fn();
+  errorHandling(error, {} as Request, res as unknown as Response, next);
+  expect(res.status).toHaveBeenCalledWith(409);
+  expect(res.json).toHaveBeenCalledWith({ error: {
+    code: "EMAIL_ALREADY_EXISTS", message: "Email is already in use", requestId: "test-request-id",
+  } });
+  expect(errorLog).not.toHaveBeenCalled();
+  expect(next).not.toHaveBeenCalled();
+});
+
+test("unrelated unique constraints remain server errors", () => {
+  const res = response();
+  const error = Object.assign(new Error("Other unique conflict"), { cause: { code: "23505", constraint: "different_index" } });
+  errorHandling(error, {} as Request, res as unknown as Response, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(500);
+  expect(res.json).toHaveBeenCalledWith({ success: false, message: "Internal server error", requestId: "test-request-id" });
+});

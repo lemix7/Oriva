@@ -114,12 +114,16 @@ port 6379 for local development. Keep dollar-containing `.env` values such as
 
 ### Protected user endpoints
 
-- `GET /users` — lists users.
-- `GET /users/:user_id` — retrieves matching user records.
-- `PUT /users/:user_id` — updates a user's name and email.
-- `DELETE /users/:user_id` — deletes a user.
+- `GET /me` — returns the authenticated user's ID, name, and email.
+- `PATCH /me` — updates their name and/or email.
 
-These endpoints require authentication but currently do not enforce per-user ownership or administrator roles. User reads currently select all columns, including password hashes; review access control and response fields before exposing these endpoints publicly.
+Emails are trimmed, lowercased, and unique after applying migration
+`0006_unique-user-email`. Duplicate registration or email updates return
+`409 EMAIL_ALREADY_EXISTS`.
+
+Password and role changes are not supported by `PATCH /me`.
+The former `/users` and `/users/:user_id` read/update/delete routes are retired.
+`POST /users` remains available for registration.
 
 ### Workspace project endpoints
 

@@ -81,14 +81,20 @@ export const tasks = pgTable(
   ],
 );
 
-export const users = pgTable("users", {
-  id: serial().primaryKey().notNull(),
-  name: varchar({ length: 30 }),
-  email: varchar({ length: 30 }),
-  password: varchar({ length: 255 }).notNull(),
-  role: varchar({ length: 50 }).default("user"),
-  profilePicKey: varchar("profile_pic_key", { length: 255 }),
-});
+export const users = pgTable(
+  "users",
+  {
+    id: serial().primaryKey().notNull(),
+    name: varchar({ length: 30 }),
+    email: varchar({ length: 30 }),
+    password: varchar({ length: 255 }).notNull(),
+    role: varchar({ length: 50 }).default("user"),
+    profilePicKey: varchar("profile_pic_key", { length: 255 }),
+  },
+  (table) => [
+    uniqueIndex("users_email_unique").on(sql`lower(trim(${table.email}))`),
+  ],
+);
 
 export const workspaces = pgTable("workspaces", {
   id: serial().primaryKey(),

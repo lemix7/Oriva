@@ -1,4 +1,4 @@
-import express, { type Response, type Request, type Express } from "express";
+import type { Request, Response } from "express";
 import * as userRepository from "../repositories/user.repository.ts";
 import bcrypt from "bcryptjs";
 import emailQueue from "../queue/email.que.ts";
@@ -6,25 +6,8 @@ import {
   uploadProfilePicture,
   deleteProfilePicture,
 } from "../adapters/profile-pic-storage.adapter.ts";
-
-const getUsers = async (req: Request, res: Response) => {
-  if (!req.user || typeof req.user === "string") {
-    return res.status(401).send("Unauthorized");
-  }
-  return res.status(403).json({ message: "Listing users is forbidden" });
-};
-
-const getUserById = async (req: Request, res: Response) => {
-  if (!req.user || typeof req.user === "string") {
-    return res.status(401).send("Unauthorized");
-  }
-  const id = Number(req.params.user_id);
-  if (id !== req.user.userId) {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-  const users = await userRepository.findUsersById(id);
-  res.status(200).json(users);
-};
+import { AppError } from "../shared/app-error.ts";
+import { editCurrentUserProfile } from "../services/user.service.ts";
 
 const createUser = async (req: Request, res: Response) => {
   const { name, email, password } = res.locals.validatedData;
@@ -63,32 +46,49 @@ const createUser = async (req: Request, res: Response) => {
   });
 };
 
-const updateUser = async (req: Request, res: Response) => {
-  if (!req.user || typeof req.user === "string") {
-    return res.status(401).send("Unauthorized");
-  }
-  const id = Number(req.params.user_id);
-  if (id !== req.user.userId) {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-  const { name, email } = req.body;
-  const updated = await userRepository.updateUser(name, email, id);
-  if (!updated) {
-    return res.status(404).json({ message: "User not found" });
-  }
-  res.status(200).send(`User modified with ID: ${id}`);
-};
+export async function getMeController(req: Request, res: Response) {
+  const userId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
 
-const deleteUser = async (req: Request, res: Response) => {
-  if (!req.user || typeof req.user === "string") {
-    return res.status(401).send("Unauthorized");
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
   }
-  const id = Number(req.params.user_id);
-  if (id !== req.user.userId) {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-  await userRepository.deleteUser(id);
-  res.status(200).send(`User deleted with ID: ${id}`);
-};
 
-export { getUsers, getUserById, createUser, updateUser, deleteUser };
+  const user = await userRepository.findUserProfileById(userId);
+
+  if (!user) {
+    throw new AppError(404, "NOT_FOUND", "User not found");
+  }
+
+  return res.status(200).json({ data: user });
+}
+
+export async function updateMeController(req: Request, res: Response) {
+  const userId =
+    req.user && typeof req.user !== "string" ? req.user.userId : undefined;
+
+  if (
+    typeof userId !== "number" ||
+    !Number.isInteger(userId) ||
+    userId <= 0 ||
+    userId > 2147483647
+  ) {
+    throw new AppError(401, "UNAUTHENTICATED", "Authentication required");
+  }
+
+  const { name, email } = res.locals.validatedData;
+
+  const user = await editCurrentUserProfile(userId, {
+    name,
+    email,
+  });
+
+  return res.status(200).json({ data: user });
+}
+
+export { createUser };

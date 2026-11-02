@@ -1,4 +1,4 @@
-import { asc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "../db/index.ts";
 import { users } from "../db/schema.ts";
 
@@ -10,14 +10,6 @@ const userFields = {
   role: users.role,
   profile_pic_key: users.profilePicKey,
 };
-
-export async function findAllUsers() {
-  return db.select(userFields).from(users).orderBy(asc(users.id));
-}
-
-export async function findUsersById(id: number) {
-  return db.select(userFields).from(users).where(eq(users.id, id));
-}
 
 export async function findUserByEmail(
   email: string,
@@ -41,13 +33,39 @@ export async function insertUser(name: string, email: string, pass: string, key:
   return user;
 }
 
-export async function updateUser(name: string, email: string, id: number) {
-  const rows = await db.update(users).set({ name: name ?? null, email: email ?? null })
-    .where(eq(users.id, id)).returning({ id: users.id });
-  return rows.length > 0;
+export async function findUserProfileById(userId: number) {
+  const [user] = await db
+    .select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  return user;
 }
 
-export async function deleteUser(id: number) {
-  const rows = await db.delete(users).where(eq(users.id, id)).returning({ id: users.id });
-  return rows.length > 0;
+export async function updateUserProfile(
+  userId: number,
+  changes: {
+    name?: string;
+    email?: string;
+  },
+) {
+  const [user] = await db
+    .update(users)
+    .set({
+      name: changes.name,
+      email: changes.email,
+    })
+    .where(eq(users.id, userId))
+    .returning({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+    });
+
+  return user;
 }

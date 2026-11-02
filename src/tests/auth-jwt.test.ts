@@ -238,6 +238,20 @@ test("login propagates signing failures without sending success", async () => {
 });
 
 
+test("login uses the normalized email and preserves the original password", async () => {
+  findUserByEmail.mockResolvedValue({ id: 42, password: "stored-hash" });
+  compare.mockResolvedValue(true);
+  sign.mockReturnValue("signed-token");
+  const req = loginRequest();
+  req.body.email = "  Learner@Example.COM  ";
+  req.body.password = " PasswordWithSpaces! ";
+  const res = loginResponse();
+  await login(req, res as unknown as Response);
+  expect(findUserByEmail).toHaveBeenCalledWith("learner@example.com");
+  expect(compare).toHaveBeenCalledWith(" PasswordWithSpaces! ", "stored-hash");
+  expect(res.status).toHaveBeenCalledWith(200);
+});
+
 test("authentication cannot initialize when the signing secret is missing", async () => {
   // Reload only for this case: SECRET_KEY is captured when the module loads.
   const secret = process.env.SECRET_KEY;
