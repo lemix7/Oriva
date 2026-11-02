@@ -9,11 +9,10 @@ import { findUserByEmail } from "../repositories/user.repository.ts";
 const SECRET_KEY = requiredEnv("SECRET_KEY");
 
 const login = async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-
   try {
     const validator = vine.compile(loginUserSchema);
     const output = await validator.validate(req.body);
+    const { email, password } = output;
 
     const user = await findUserByEmail(email);
 

@@ -5,11 +5,14 @@ import express, {
   type Express,
   response,
 } from "express";
-import userRouter from "./routes/users.routes.ts";
 import errorHandling from "./middleware/error-handling.ts";
 import looger from "./middleware/logger.ts";
 import { login, authenticateJWT } from "./auth/auth-jwt.ts";
-import { createUser } from "./controllers/users.controller.ts";
+import {
+  createUser,
+  getMeController,
+  updateMeController,
+} from "./controllers/users.controller.ts";
 import {
   createUserValidator,
   loginUserValidator,
@@ -21,6 +24,7 @@ import requestId from "./middleware/request-id.ts";
 import loginRateLimit from "./middleware/login-rate-limit.ts";
 import workspaceRouter from "./routes/workspaces.routes.ts";
 import invitationRouter from "./routes/invitations.routes.ts";
+import { updateCurrentUserValidator } from "./validators/current-user-update.validator.ts";
 
 const app: Express = express();
 
@@ -52,11 +56,16 @@ app.get("/error", (req: Request, res: Response) => {
 app.use(authenticateJWT);
 
 // Protected endpoints
+app.get("/me", getMeController);
+app.patch(
+  "/me",
+  validate(updateCurrentUserValidator, messageProvider),
+  updateMeController,
+);
 app.use("/invitations", invitationRouter);
 app.use("/workspaces", workspaceRouter);
-// Retire creator-only project/task URLs before the /users/:user_id router
-// can interpret "projects" as a user ID. Workspace routes enforce membership.
-app.use(["/users/projects", "/projects"], (_req, res) => {
+
+app.use((_req, res) => {
   res.status(404).json({
     error: {
       code: "NOT_FOUND",
@@ -65,7 +74,6 @@ app.use(["/users/projects", "/projects"], (_req, res) => {
     },
   });
 });
-app.use("/users", userRouter);
 
 app.use(errorHandling);
 

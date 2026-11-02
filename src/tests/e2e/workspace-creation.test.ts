@@ -13,9 +13,11 @@ const queueEmail = jest.fn<(...args: unknown[]) => Promise<unknown>>();
 jest.unstable_mockModule("../../queue/email.que.js", () => ({
   default: { add: queueEmail },
 }));
+const uploadProfilePicture = jest.fn<(...args: unknown[]) => Promise<string>>();
+const deleteProfilePicture = jest.fn<(...args: unknown[]) => Promise<void>>();
 jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => ({
-  uploadProfilePicture: jest.fn(),
-  deleteProfilePicture: jest.fn(),
+  uploadProfilePicture,
+  deleteProfilePicture,
 }));
 
 const requestLog = jest.spyOn(console, "log").mockImplementation(() => {});
@@ -56,6 +58,8 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   queueEmail.mockReset().mockResolvedValue(undefined);
+  uploadProfilePicture.mockReset().mockResolvedValue("private/test-avatar.png");
+  deleteProfilePicture.mockReset().mockResolvedValue(undefined);
   // Each test has its own login allowance; keep the real login/auth flow.
   loginRateLimit.resetKey("127.0.0.1");
   userIds = [];
@@ -133,6 +137,282 @@ async function create(body: unknown, token?: string) {
     signal: AbortSignal.timeout(5000),
   });
 }
+
+async function getMe(token?: string, query = "") {
+  return fetch(`${baseUrl}/me${query}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+test("GET /me returns each logged-in account's safe profile and ignores claimed IDs", async () => {
+  await pool!.query("UPDATE users SET profile_pic_key = 'private/test-avatar.png' WHERE id = ANY($1::int[])", [userIds]);
+  const fixtures = await pool!.query("SELECT id, name, email FROM users WHERE id = ANY($1::int[]) ORDER BY id", [userIds]);
+  for (const user of fixtures.rows) {
+    const token = await login(user.email);
+    const otherId = userIds.find(id => id !== user.id)!;
+    const response = await getMe(token, `?userId=${otherId}&id=${otherId}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ data: user });
+  }
+});
+
+test("GET /me requires authentication", async () => {
+  const response = await getMe();
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("GET /me returns 404 when a valid token's account has been deleted", async () => {
+  const token = await login();
+  await pool!.query("DELETE FROM users WHERE id = $1", [userIds[0]]);
+  const response = await getMe(token);
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({ error: {
+    code: "NOT_FOUND", message: "User not found", requestId: expect.any(String),
+  } });
+});
+
+test("GET /me reads current profile fields rather than stale token values", async () => {
+  const token = await login();
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`;
+  await pool!.query("UPDATE users SET name = $1, email = $2 WHERE id = $3", ["Updated profile", email, userIds[0]]);
+  const response = await getMe(token);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: { id: userIds[0], name: "Updated profile", email } });
+});
+
+async function patchMe(body: unknown, token?: string) {
+  return fetch(`${baseUrl}/me`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function profileAccountsSnapshot() {
+  return (await pool!.query("SELECT * FROM users WHERE id = ANY($1::int[]) ORDER BY id", [userIds])).rows;
+}
+
+test("PATCH /me changes only the logged-in account and ignores protected fields", async () => {
+  const token = await login();
+  const before = await profileAccountsSnapshot();
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`;
+  const response = await patchMe({
+    name: "  Updated profile  ", email: `  ${email}  `,
+    id: userIds[1], userId: userIds[1], role: "owner", password: "IgnoredNewPassword!",
+    profilePicKey: "private/ignored.png", profile_pic_key: "private/ignored.png",
+  }, token);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ data: { id: userIds[0], name: "Updated profile", email } });
+  expect(await profileAccountsSnapshot()).toEqual([
+    { ...before[0], name: "Updated profile", email }, before[1],
+  ]);
+  const read = await getMe(token);
+  expect(read.status).toBe(200);
+  expect(await read.json()).toEqual({ data: { id: userIds[0], name: "Updated profile", email } });
+  // The existing password must still authenticate after a profile edit.
+  await login(email);
+});
+
+test("PATCH /me supports name-only and email-only edits", async () => {
+  const token = await login();
+  const before = await profileAccountsSnapshot();
+  const renamed = await patchMe({ name: "Changed name" }, token);
+  expect(renamed.status).toBe(200);
+  expect(await renamed.json()).toEqual({ data: { id: userIds[0], name: "Changed name", email: ownerEmail } });
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`;
+  const changedEmail = await patchMe({ email }, token);
+  expect(changedEmail.status).toBe(200);
+  expect(await changedEmail.json()).toEqual({ data: { id: userIds[0], name: "Changed name", email } });
+  expect(await profileAccountsSnapshot()).toEqual([{ ...before[0], name: "Changed name", email }, before[1]]);
+});
+
+test("PATCH /me authenticates before validating or modifying accounts", async () => {
+  const before = await profileAccountsSnapshot();
+  const response = await patchMe({ name: 123, role: "owner" });
+  expect(response.status).toBe(401);
+  await response.text();
+  expect(await profileAccountsSnapshot()).toEqual(before);
+});
+
+test.each([{}, { userId: 123, role: "owner", password: "IgnoredNewPassword!" }, { name: null }, { email: null }])(
+  "PATCH /me rejects updates without editable values: %j", async body => {
+    const token = await login();
+    const before = await profileAccountsSnapshot();
+    const response = await patchMe(body, token);
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("EMPTY_UPDATE");
+    expect(await profileAccountsSnapshot()).toEqual(before);
+  },
+);
+
+test("PATCH /me validates lengths, types, and email syntax without partially saving valid fields", async () => {
+  const token = await login();
+  const before = await profileAccountsSnapshot();
+  for (const [field, value] of [
+    ["name", ""], ["name", "    "], ["name", "abcd"], ["name", "x".repeat(31)],
+    ["name", 123], ["name", {}], ["name", []],
+    ["email", ""], ["email", "invalid-email"], ["email", "a".repeat(19) + "@example.com"],
+    ["email", 123], ["email", {}], ["email", []],
+  ] as const) {
+    const response = await patchMe({ name: "Valid name", email: ownerEmail, [field]: value }, token);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    expect(await profileAccountsSnapshot()).toEqual(before);
+  }
+});
+
+test("PATCH /me accepts the declared name and email length boundaries", async () => {
+  const token = await login();
+  const email = "a".repeat(18) + "@example.com";
+  const maximum = await patchMe({ name: "N".repeat(30), email }, token);
+  expect(maximum.status).toBe(200);
+  expect(await maximum.json()).toEqual({ data: { id: userIds[0], name: "N".repeat(30), email } });
+  const minimum = await patchMe({ name: "ABCDE" }, token);
+  expect(minimum.status).toBe(200);
+  expect(await minimum.json()).toEqual({ data: { id: userIds[0], name: "ABCDE", email } });
+});
+
+test("PATCH /me returns 404 for a deleted account without changing another account", async () => {
+  const token = await login();
+  await pool!.query("DELETE FROM users WHERE id = $1", [userIds[0]]);
+  const before = await profileAccountsSnapshot();
+  const response = await patchMe({ name: "Changed name" }, token);
+  expect(response.status).toBe(404);
+  expect(await response.json()).toEqual({ error: { code: "NOT_FOUND", message: "User not found", requestId: expect.any(String) } });
+  expect(await profileAccountsSnapshot()).toEqual(before);
+});
+
+async function registerProfileAccount(email: string) {
+  const response = await fetch(`${baseUrl}/users`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Registered fixture", email, password }),
+    signal: AbortSignal.timeout(5000),
+  });
+  // Track persisted accounts even if a later assertion fails.
+  const rows = await pool!.query("SELECT id FROM users WHERE lower(trim(email)) = $1", [email.trim().toLowerCase()]);
+  for (const row of rows.rows) if (!userIds.includes(row.id)) userIds.push(row.id);
+  return response;
+}
+
+function expectEmailConflict(body: unknown) {
+  expect(body).toEqual({ error: {
+    code: "EMAIL_ALREADY_EXISTS", message: "Email is already in use", requestId: expect.any(String),
+  } });
+}
+
+test("registration normalizes email and mixed-case login finds the same account", async () => {
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 12)}@test.local`;
+  const response = await registerProfileAccount(`  ${email.toUpperCase()}  `);
+  expect(response.status).toBe(201);
+  const body = await response.json();
+  expect(body).toEqual({ message: "User created successfully", id: expect.any(Number) });
+  const saved = await pool!.query("SELECT email FROM users WHERE id = $1", [body.id]);
+  expect(saved.rows).toEqual([{ email }]);
+  const token = await login(`  ${email.toUpperCase()}  `);
+  const profile = await getMe(token);
+  expect(profile.status).toBe(200);
+  expect(await profile.json()).toEqual({ data: { id: body.id, name: "Registered fixture", email } });
+  expect(queueEmail).toHaveBeenCalledTimes(1);
+});
+
+test.each(["exact", "uppercase", "spaces"])("duplicate registration returns 409 for an %s email match", async variant => {
+  const before = await profileAccountsSnapshot();
+  const email = variant === "uppercase" ? ownerEmail.toUpperCase()
+    : variant === "spaces" ? `  ${ownerEmail}  ` : ownerEmail;
+  const response = await registerProfileAccount(email);
+  expect(response.status).toBe(409);
+  expectEmailConflict(await response.json());
+  expect(await profileAccountsSnapshot()).toEqual(before);
+  expect(queueEmail).not.toHaveBeenCalled();
+});
+
+test("duplicate registration cleans up its uploaded image without queuing an email", async () => {
+  const before = await profileAccountsSnapshot();
+  const form = new FormData();
+  form.set("name", "Duplicate registration");
+  form.set("email", ownerEmail.toUpperCase());
+  form.set("password", password);
+  form.set("profilePic", new Blob(["test image"], { type: "image/png" }), "avatar.png");
+  const response = await fetch(`${baseUrl}/users`, { method: "POST", body: form, signal: AbortSignal.timeout(5000) });
+  expect(response.status).toBe(409);
+  expectEmailConflict(await response.json());
+  expect(uploadProfilePicture).toHaveBeenCalledTimes(1);
+  expect(deleteProfilePicture).toHaveBeenCalledWith("private/test-avatar.png");
+  expect(queueEmail).not.toHaveBeenCalled();
+  expect(await profileAccountsSnapshot()).toEqual(before);
+});
+
+test("simultaneous duplicate registrations create exactly one account and email job", async () => {
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 12)}@test.local`;
+  const responses = await Promise.all([
+    registerProfileAccount(email), registerProfileAccount(` ${email.toUpperCase()} `),
+  ]);
+  expect(responses.map(response => response.status).sort()).toEqual([201, 409]);
+  for (const response of responses) {
+    const body = await response.json();
+    if (response.status === 409) expectEmailConflict(body);
+    else expect(body).toEqual({ message: "User created successfully", id: expect.any(Number) });
+  }
+  const saved = await pool!.query("SELECT email FROM users WHERE lower(trim(email)) = $1", [email]);
+  expect(saved.rows).toEqual([{ email }]);
+  expect(queueEmail).toHaveBeenCalledTimes(1);
+});
+
+test.each(["exact", "uppercase", "spaces"])("profile update rejects another account's email (%s) without saving its name", async variant => {
+  const token = await login();
+  const before = await profileAccountsSnapshot();
+  const original = before[1].email as string;
+  const email = variant === "uppercase" ? original.toUpperCase()
+    : variant === "spaces" ? `  ${original}  ` : original;
+  const response = await patchMe({ name: "Rejected profile name", email }, token);
+  expect(response.status).toBe(409);
+  expectEmailConflict(await response.json());
+  expect(await profileAccountsSnapshot()).toEqual(before);
+  expect(queueEmail).not.toHaveBeenCalled();
+});
+
+test("profile updates normalize new emails and can retain the current email", async () => {
+  const token = await login();
+  const unchanged = await patchMe({ name: "Same email owner", email: `  ${ownerEmail.toUpperCase()}  ` }, token);
+  expect(unchanged.status).toBe(200);
+  expect(await unchanged.json()).toEqual({ data: { id: userIds[0], name: "Same email owner", email: ownerEmail } });
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 12)}@test.local`;
+  const changed = await patchMe({ email: `  ${email.toUpperCase()}  ` }, token);
+  expect(changed.status).toBe(200);
+  expect(await changed.json()).toEqual({ data: { id: userIds[0], name: "Same email owner", email } });
+  const saved = await pool!.query("SELECT email FROM users WHERE id = $1", [userIds[0]]);
+  expect(saved.rows).toEqual([{ email }]);
+  await login(email.toUpperCase());
+});
+
+test("simultaneous profile edits cannot claim the same email for two accounts", async () => {
+  const before = await profileAccountsSnapshot();
+  const firstToken = await login();
+  const secondToken = await login(before[1].email);
+  const email = `${randomUUID().replace(/-/g, "").slice(0, 12)}@test.local`;
+  const responses = await Promise.all([
+    patchMe({ name: "First claimant", email }, firstToken),
+    patchMe({ name: "Second claimant", email: `  ${email.toUpperCase()}  ` }, secondToken),
+  ]);
+  expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+  const saved = await profileAccountsSnapshot();
+  for (const [index, response] of responses.entries()) {
+    const body = await response.json();
+    if (response.status === 409) {
+      expectEmailConflict(body);
+      expect(saved[index]).toEqual(before[index]);
+    } else {
+      const name = index === 0 ? "First claimant" : "Second claimant";
+      expect(body).toEqual({ data: { id: userIds[index], name, email } });
+      expect(saved[index]).toEqual({ ...before[index], name, email });
+    }
+  }
+  expect(saved.filter(row => row.email === email)).toHaveLength(1);
+});
 
 async function list(token: string, afterId?: number) {
   const url = new URL("/workspaces", baseUrl);
