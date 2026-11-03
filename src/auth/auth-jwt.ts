@@ -3,48 +3,37 @@ import { type NextFunction, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
 import { requiredEnv } from "../config/env.ts";
 import { loginUserSchema } from "../validators/users.validator.ts";
-import vine, { errors } from "@vinejs/vine";
+import vine from "@vinejs/vine";
+import { createLoginSession } from "../services/auth-session.service.ts";
+import { setRefreshCookie } from "./refresh-cookie.ts";
 import { findUserByEmail } from "../repositories/user.repository.ts";
 
 const SECRET_KEY = requiredEnv("SECRET_KEY");
 
 const login = async (req: Request, res: Response) => {
-  try {
-    const validator = vine.compile(loginUserSchema);
-    const output = await validator.validate(req.body);
-    const { email, password } = output;
+  const validator = vine.compile(loginUserSchema);
+  const { email, password } = await validator.validate(req.body);
 
-    const user = await findUserByEmail(email);
+  const user = await findUserByEmail(email);
 
-    if (!user) {
-      return res.status(401).send("Invalid credentials");
-    }
-
-    const isValid = await bcrypt.compare(password, user.password);
-
-    if (!isValid) {
-      return res.status(401).send("Invalid credentials");
-    }
-
-    const token = jwt.sign({ userId: user.id }, SECRET_KEY, {
-      expiresIn: "1h",
-      algorithm: "HS256",
-    });
-
-    if (!token) {
-      throw new Error("falied to create a token");
-    }
-
-    res.status(200).send({
-      message: "Login successfull",
-      token: token,
-    });
-  } catch (error) {
-    if (error instanceof errors.E_VALIDATION_ERROR) {
-      res.status(error.status).send(error.message);
-    }
-    throw error;
+  if (!user) {
+    return res.status(401).send("Invalid credentials");
   }
+
+  const validPassword = await bcrypt.compare(password, user.password);
+
+  if (!validPassword) {
+    return res.status(401).send("Invalid credentials");
+  }
+
+  const tokens = await createLoginSession(user.id, user.password);
+
+  setRefreshCookie(res, tokens.refreshToken, tokens.refreshExpiresAt);
+
+  return res.status(200).json({
+    message: "Login successfull",
+    token: tokens.accessToken,
+  });
 };
 
 const authenticateJWT = async (
@@ -53,15 +42,16 @@ const authenticateJWT = async (
   next: NextFunction,
 ) => {
   const authHeader = req.headers.authorization;
-  const token = authHeader?.startsWith("Bearer")
+  const token = authHeader?.startsWith("Bearer ")
     ? authHeader.slice(7)
     : undefined;
 
   if (token) {
-    jwt.verify(token, SECRET_KEY, (err, user) => {
+    jwt.verify(token, SECRET_KEY, { algorithms: ["HS256"] }, (err, user) => {
       if (err) {
-        return res.status(403).send("Invalid token");
+        return res.status(401).send("Invalid token");
       }
+
       req.user = user;
       next();
     });

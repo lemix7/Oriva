@@ -23,6 +23,8 @@ jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => 
 const requestLog = jest.spyOn(console, "log").mockImplementation(() => {});
 const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
 const originalDatabaseUrl = process.env.DATABASE_URL;
+const originalAppOrigin = process.env.APP_ORIGIN;
+const testAppOrigin = "http://localhost:5173";
 const originalSecret = process.env.SECRET_KEY;
 const password = "workspace-test-password";
 let passwordHash: string;
@@ -45,6 +47,7 @@ beforeAll(async () => {
     throw new Error("Workspace HTTP tests require local oriva_test");
   }
   process.env.DATABASE_URL = connectionString;
+  process.env.APP_ORIGIN = testAppOrigin;
   process.env.SECRET_KEY = "workspace-http-test-secret";
   ({ default: pool } = await import("../../pool/pooler.ts"));
   passwordHash = await bcrypt.hash(password, 8);
@@ -103,7 +106,9 @@ afterAll(async () => {
     }
   } finally {
     try { await pool?.end(); } finally {
-      if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    if (originalAppOrigin === undefined) delete process.env.APP_ORIGIN;
+    else process.env.APP_ORIGIN = originalAppOrigin;
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
       else process.env.DATABASE_URL = originalDatabaseUrl;
       if (originalSecret === undefined) delete process.env.SECRET_KEY;
       else process.env.SECRET_KEY = originalSecret;
@@ -116,7 +121,7 @@ afterAll(async () => {
 async function login(email = ownerEmail): Promise<string> {
   const response = await fetch(`${baseUrl}/login`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { origin: testAppOrigin, "content-type": "application/json" },
     body: JSON.stringify({ email, password }),
     signal: AbortSignal.timeout(5000),
   });

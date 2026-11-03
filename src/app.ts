@@ -25,20 +25,28 @@ import loginRateLimit from "./middleware/login-rate-limit.ts";
 import workspaceRouter from "./routes/workspaces.routes.ts";
 import invitationRouter from "./routes/invitations.routes.ts";
 import { updateCurrentUserValidator } from "./validators/current-user-update.validator.ts";
+import cookieParser from "cookie-parser";
+import { requireTrustedOrigin } from "./middleware/trusted-origin.ts";
+import {
+  refreshSessionController,
+  logoutSessionController,
+} from "./controllers/auth-session.controller.ts";
 
 const app: Express = express();
 
 app.use(requestId);
 app.use(looger);
 app.use(express.json());
+app.use(cookieParser());
 
 // Public endpoints no token required
 app.get("/", (req: Request, res: Response) => {
   res.status(200).json("Hello world");
 });
-app.use(
+app.post(
   "/login",
   loginRateLimit,
+  requireTrustedOrigin,
   validate(loginUserValidator, messageProvider),
   login,
 );
@@ -52,6 +60,10 @@ app.post(
 app.get("/error", (req: Request, res: Response) => {
   throw new Error("testing the error middleware");
 });
+
+app.post("/auth/refresh", requireTrustedOrigin, refreshSessionController);
+
+app.post("/auth/logout", requireTrustedOrigin, logoutSessionController);
 
 app.use(authenticateJWT);
 
