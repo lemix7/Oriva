@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { and, eq, sql } from "drizzle-orm";
-import { projects, tasks, users, workspaces, workspaceMembers } from "../src/db/schema.ts";
+import { projects, projectStatuses, tasks, users, workspaces, workspaceMembers } from "../src/db/schema.ts";
 
 export function seedDatabaseUrl(connectionString: string | undefined): string {
   if (!connectionString) throw new Error("TEST_DATABASE_URL is required");
@@ -27,7 +27,7 @@ export async function seedDemo(
   db: Pick<NodePgDatabase, "transaction">,
 ): Promise<void> {
   await db.transaction(async (tx) => {
-    // Serialize seed runs: email and project names currently have no unique constraints.
+    // Serialize seed runs so name-based workspace and project lookups stay safe.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(71342, 1)`);
     const email = "demo.owner@example.com";
     const createdAt = new Date("2026-01-01T00:00:00Z");
@@ -120,6 +120,18 @@ export async function seedDemo(
       projectId = createdProject.id;
     }
 
+    await tx
+      .insert(projectStatuses)
+      .values([
+        { projectId, name: "Backlog", position: 1000, isDone: false },
+        { projectId, name: "In Progress", position: 2000, isDone: false },
+        { projectId, name: "Review", position: 3000, isDone: false },
+        { projectId, name: "Done", position: 4000, isDone: true },
+      ].map(status => ({ ...status, createdAt, updatedAt: createdAt })))
+      .onConflictDoNothing({
+        target: [projectStatuses.projectId, projectStatuses.name],
+      });
+
     const demoTasks = [
       { title: "Plan the project", status: "done" },
       { title: "Build the first feature", status: "on progress" },
@@ -153,7 +165,7 @@ async function main(): Promise<void> {
   try {
     await client.connect();
     await seedDemo(drizzle({ client }));
-    console.log("Local demo owner, project, and two tasks are ready");
+    console.log("Local demo owner, workspace, project, four statuses, and two tasks are ready");
   } finally {
     await client.end();
   }

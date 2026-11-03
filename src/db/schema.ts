@@ -11,6 +11,7 @@ import {
   primaryKey,
   uniqueIndex,
   index,
+  boolean,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import pg from "pg";
@@ -58,6 +59,35 @@ export const projects = pgTable(
   ],
 );
 
+export const projectStatuses = pgTable(
+  "project_statuses",
+  {
+    id: serial().primaryKey(),
+    projectId: integer("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    name: varchar({ length: 50 }).notNull(),
+    position: integer().notNull(),
+    isDone: boolean("is_done").default(false).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_statuses_project_name_unique").on(
+      table.projectId,
+      table.name,
+    ),
+    uniqueIndex("project_statuses_id_project_unique").on(
+      table.id,
+      table.projectId,
+    ),
+  ],
+);
+
 export const tasks = pgTable(
   "tasks",
   {
@@ -67,6 +97,7 @@ export const tasks = pgTable(
     description: varchar({ length: 255 }),
     status: varchar({ length: 50 }).default("on progress"),
     createdAt: pgDate("created_at").default(sql`CURRENT_DATE`),
+    statusId: integer("status_id"),
   },
   (table) => [
     foreignKey({
@@ -74,6 +105,11 @@ export const tasks = pgTable(
       foreignColumns: [projects.id],
       name: "tasks_project_id_fkey",
     }),
+    foreignKey({
+      columns: [table.statusId, table.projectId],
+      foreignColumns: [projectStatuses.id, projectStatuses.projectId],
+      name: "tasks_status_project_fk",
+    }).onDelete("restrict"),
     check(
       "tasks_status_check",
       sql`(status)::text = ANY (ARRAY[('done'::character varying)::text, ('on progress'::character varying)::text, ('cancelled'::character varying)::text])`,
