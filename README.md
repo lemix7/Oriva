@@ -5,7 +5,7 @@ A project and task management REST API built with Express, TypeScript, and Postg
 ## Features
 
 - User registration with bcrypt password hashing and optional profile pictures.
-- JWT authentication with tokens that expire after one hour.
+- JWT authentication with 15-minute access tokens and rotating seven-day refresh sessions.
 - Create, read, update, and delete projects and tasks.
 - Project and task access scoped to workspace membership and roles.
 - Request body validation with VineJS.
@@ -39,6 +39,7 @@ Create a `.env` file in the project root:
 PORT=4000
 DATABASE_URL=postgresql://USERNAME:PASSWORD@localhost:5432/oriva
 SECRET_KEY=replace-with-a-long-random-secret
+APP_ORIGIN=http://localhost:5173
 AWS_REGION=your-aws-region
 AWS_ACCESS_KEY_ID=your-aws-access-key-id
 AWS_SECRET_ACCESS_KEY=your-aws-secret-access-key
@@ -52,13 +53,18 @@ Redis settings are currently defined in `src/config/redis.ts`; they are not read
 
 ### 3. Prepare PostgreSQL
 
-The repository does not currently include database migrations or a schema setup script. Before running the API, provision the tables and relationships expected by the queries:
+The schema is defined in `src/db/schema.ts`, with versioned migrations in
+`drizzle/`. Create the target database, then configure its direct connection as
+`MIGRATION_DATABASE_URL` or `DATABASE_URL_UNPOOLED` in `.env.neon` (or the process
+environment) and apply the migrations:
 
-- `users`: `id`, `name`, `email`, `password`, `profile_pic_key`.
-- `projects`: `id`, `name`, `description`, `status`, `user_id`, `created_at`.
-- `tasks`: `id`, `title`, `description`, `status`, `project_id`.
+```bash
+npm run db:migrate
+```
 
-`projects.user_id` references a user, and `tasks.project_id` references a project. The lists above describe the columns used by the application, not a complete schema definition. Configure types, constraints, defaults, and deletion behavior in your database.
+This includes workspaces, projects, tasks, project statuses, invitations, and
+refresh sessions. Integration and HTTP tests use the separate local `oriva_test`
+database configured by `TEST_DATABASE_URL` in `.env.test`.
 
 ### 4. Start Redis
 
@@ -110,7 +116,27 @@ port 6379 for local development. Keep dollar-containing `.env` values such as
 
 - `GET /` — returns a greeting.
 - `POST /users` — registers a user; accepts JSON or multipart form data.
-- `POST /login` — returns a JWT for valid credentials.
+- `POST /login` — returns a 15-minute access JWT and sets an HttpOnly refresh cookie.
+- `POST /auth/refresh` — rotates the refresh cookie and returns a new access JWT.
+- `POST /auth/logout` — revokes the cookie's login family and clears the cookie.
+
+Login, refresh, and logout require an `Origin` header matching `APP_ORIGIN`;
+missing or untrusted origins return `403 UNTRUSTED_ORIGIN`. Configure this value
+to the frontend origin (scheme, hostname, and port) in each environment.
+Refresh/logout use the cookie and do not require a valid access JWT. Send access
+tokens in the `Authorization: Bearer ...` header for other protected endpoints.
+
+Refresh tokens are stored only as hashes in PostgreSQL. Rotation preserves the
+original seven-day expiry. Reusing a rotated token revokes that login's entire
+family and returns `401 REFRESH_TOKEN_REUSED`; other login families are unaffected.
+The frontend must share one pending refresh request across concurrent API calls.
+Logout revokes refresh sessions; already-issued access JWTs remain valid until
+their normal expiry. Invalid or expired access JWTs return `401`.
+
+Set `NODE_ENV=production` on the deployed server. Production refresh cookies use
+the `__Host-oriva_refresh` name, `Secure`, `HttpOnly`, `SameSite=Lax`, and `Path=/`
+without a Domain attribute; development uses `oriva_refresh` and permits HTTP.
+Authentication responses are marked `Cache-Control: no-store`.
 
 ### Protected user endpoints
 
@@ -207,12 +233,30 @@ curl -X POST http://localhost:4000/users \
   -F 'profilePic=@/absolute/path/to/profile.png'
 ```
 
-Log in and copy the `token` from the response:
+Log in and copy the access `token` from the response. Save the refresh cookie
+in a temporary cookie jar outside the repository:
 
 ```bash
-curl -X POST http://localhost:4000/login \
+cookie_jar=$(mktemp)
+curl -c "$cookie_jar" -X POST http://localhost:4000/login \
+  -H 'Origin: http://localhost:5173' \
   -H 'Content-Type: application/json' \
   -d '{"email":"alex@example.com","password":"example-password"}'
+```
+
+Refresh without sending an access token, replacing the saved cookie:
+
+```bash
+curl -b "$cookie_jar" -c "$cookie_jar" -X POST http://localhost:4000/auth/refresh \
+  -H 'Origin: http://localhost:5173'
+```
+
+To log out this session:
+
+```bash
+curl -b "$cookie_jar" -c "$cookie_jar" -X POST http://localhost:4000/auth/logout \
+  -H 'Origin: http://localhost:5173'
+rm "$cookie_jar"
 ```
 
 Create a workspace first (use the returned workspace ID in the project URL):
@@ -277,7 +321,8 @@ unlimited guarantee against duplicate delivery.
 ## Verification and development notes
 
 `src/config/env.ts` loads environment settings once and provides `requiredEnv`.
-Database access requires `DATABASE_URL`; authentication requires `SECRET_KEY`;
+Database access requires `DATABASE_URL`; authentication requires `SECRET_KEY`
+and `APP_ORIGIN`;
 the email worker requires `RESEND_API_KEY`; profile storage requires
 `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_BUCKET_NAME`.
 Each component checks its settings when initialized. Missing or whitespace-only
@@ -321,7 +366,7 @@ Keep the SSL parameters supplied by Neon. Do not commit or print connection stri
 including tables, sequences, constraints, indexes, and cache functions/triggers.
 It includes the changes from migrations 001–003; do not replay those on top of
 this baseline. The snapshot was imported into Neon without existing user,
-project, or task rows. It does not include the future workspace blueprint.
+project, or task rows.
 Express uses Neon's pooled connection through `DATABASE_URL` in `.env`.
 Docker uses the same Neon connection through `DOCKER_DATABASE_URL`.
 Previous local URLs are preserved as `LOCAL_DATABASE_URL` and
@@ -343,8 +388,9 @@ same transaction. Workspace task reads currently query PostgreSQL directly.
 
 The schema's custom date mappings reuse `pg` parsers so existing timestamps
 and date values keep their previous JavaScript types and timezone behavior.
-The database schema and cache triggers are unchanged. Login uses the Drizzle-backed
-`findUserByEmail` repository function; password checks and JWT behavior are unchanged.
+Login uses the Drizzle-backed `findUserByEmail` repository function and bcrypt
+password verification. Refresh sessions are persisted in PostgreSQL and protected
+by user/session row locks during rotation and revocation.
 
 ## Local demo seed
 

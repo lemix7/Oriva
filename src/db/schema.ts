@@ -12,6 +12,7 @@ import {
   uniqueIndex,
   index,
   boolean,
+  uuid,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import pg from "pg";
@@ -209,5 +210,30 @@ export const invitations = pgTable(
     check("invitations_role_check", sql`${table.role} IN ('editor', 'viewer')`),
     index("invitations_workspace_idx").on(table.workspaceId),
     index("invitations_invited_by_idx").on(table.invitedBy),
+  ],
+);
+
+export const refreshSessions = pgTable(
+  "refresh_sessions",
+  {
+    id: serial().primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    familyId: uuid("family_id").defaultRandom().notNull(),
+    tokenHash: varchar("token_hash", { length: 64 }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    rotatedAt: timestamp("rotated_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("refresh_sessions_token_hash_unique").on(table.tokenHash),
+    index("refresh_sessions_user_family_idx").on(table.userId, table.familyId),
   ],
 );

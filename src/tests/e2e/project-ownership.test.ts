@@ -34,6 +34,8 @@ const userIds: number[] = [];
 const projectIds: number[] = [];
 const workspaceIds: number[] = [];
 const originalDatabaseUrl = process.env.DATABASE_URL;
+const originalAppOrigin = process.env.APP_ORIGIN;
+const testAppOrigin = "http://localhost:5173";
 const originalSecret = process.env.SECRET_KEY;
 
 beforeAll(async () => {
@@ -51,6 +53,7 @@ beforeAll(async () => {
   // Real login and verification share this test-only secret. Set it and the
   // test connection before any application modules read their environment.
   process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.APP_ORIGIN = testAppOrigin;
   process.env.SECRET_KEY = "e2e-only-secret-for-project-ownership";
   ({ default: pool } = await import("../../pool/pooler.ts"));
   const result = await pool.query("SELECT current_database() AS database");
@@ -123,7 +126,9 @@ afterAll(async () => {
     try {
       await pool?.end();
     } finally {
-      if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      if (originalAppOrigin === undefined) delete process.env.APP_ORIGIN;
+      else process.env.APP_ORIGIN = originalAppOrigin;
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
       else process.env.DATABASE_URL = originalDatabaseUrl;
       if (originalSecret === undefined) delete process.env.SECRET_KEY;
       else process.env.SECRET_KEY = originalSecret;
@@ -134,7 +139,7 @@ afterAll(async () => {
 async function loginAs(email: string): Promise<string> {
   const response = await fetch(`${baseUrl}/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { origin: testAppOrigin, "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
     signal: AbortSignal.timeout(5000),
   });
