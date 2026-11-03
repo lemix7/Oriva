@@ -14,6 +14,7 @@ import {
 } from "../repositories/project.repository.ts";
 import { AppError } from "../shared/app-error.ts";
 import { requireWorkspaceMembership } from "./workspaces.service.ts";
+import { insertDefaultProjectStatuses } from "../repositories/project-status.repository.ts";
 
 export async function createWorkspaceProject(
   workspaceId: number,
@@ -50,6 +51,8 @@ export async function createWorkspaceProject(
     if (!project) {
       throw new Error("Project insert returned no row");
     }
+
+    await insertDefaultProjectStatuses  (tx, project.id);
 
     return project;
   });
@@ -173,11 +176,7 @@ export async function removeWorkspaceProject(
       );
     }
 
-    const removed = await deleteWorkspaceProject(
-      tx,
-      workspaceId,
-      projectId,
-    );
+    const removed = await deleteWorkspaceProject(tx, workspaceId, projectId);
 
     // Optional: append this catch to the deletion call to return 409 when a
     // legacy task write races with deletion. The foreign key still protects

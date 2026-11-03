@@ -21,7 +21,8 @@ export default defineConfig({
     "tasks",
     "workspaces",
     "workspace_members",
-    "invitations"
+    "invitations",
+    "project_statuses",
   ],
   dbCredentials: { url },
   schema: "./src/db/schema.ts",

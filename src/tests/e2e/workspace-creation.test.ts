@@ -414,6 +414,610 @@ test("simultaneous profile edits cannot claim the same email for two accounts", 
   expect(saved.filter(row => row.email === email)).toHaveLength(1);
 });
 
+async function listStatuses(workspaceId: number | string, projectId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/statuses`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor", "viewer"] as const)("an %s can list the default statuses created with a project", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role === "owner" ? "editor" : role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const response = await listStatuses(workspaceId, project.id, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  const saved = await pool!.query("SELECT * FROM project_statuses WHERE project_id = $1 ORDER BY position, id", [project.id]);
+  expect(await response.json()).toEqual({ data: saved.rows.map(row => ({
+    id: row.id, projectId: project.id, name: row.name, position: row.position, isDone: row.is_done,
+    createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(),
+  })) });
+  expect(saved.rows.map(row => [row.name, row.position, row.is_done])).toEqual([
+    ["Backlog", 1000, false], ["In Progress", 2000, false], ["Review", 3000, false], ["Done", 4000, true],
+  ]);
+});
+
+test("an editor-created project also receives its own default statuses", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const first = await projectFixtureForHttp(workspaceId, ownerToken);
+  const second = await projectFixtureForHttp(workspaceId, otherToken);
+  const firstResponse = await listStatuses(workspaceId, first.id, ownerToken);
+  const secondResponse = await listStatuses(workspaceId, second.id, otherToken);
+  expect(firstResponse.status).toBe(200);
+  expect(secondResponse.status).toBe(200);
+  const a = (await firstResponse.json()).data as { id: number; projectId: number }[];
+  const b = (await secondResponse.json()).data as { id: number; projectId: number }[];
+  expect(b).toHaveLength(4);
+  expect(b.every(row => row.projectId === second.id && !a.some(other => other.id === row.id))).toBe(true);
+});
+
+test("outsiders cannot list project statuses", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("outsider");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const response = await listStatuses(workspaceId, project.id, otherToken);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("removed creators cannot list statuses of their former workspace projects", async () => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, otherToken);
+  const removed = await removeMember(workspaceId, userIds[1], ownerToken);
+  expect(removed.status).toBe(204);
+  await removed.text();
+  const response = await listStatuses(workspaceId, project.id, otherToken);
+  expect(response.status).toBe(404);
+  expect((await response.json()).error.code).toBe("NOT_FOUND");
+});
+
+test("status listing requires authentication before route validation", async () => {
+  const response = await listStatuses("invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("status listing validates workspace and project IDs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await listStatuses(field === "wid" ? invalid : workspaceId, field === "pid" ? invalid : project.id, ownerToken);
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+});
+
+test("status lookup rejects missing and mismatched workspace/project pairs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const otherResponse = await create({ name: "Other status workspace" }, ownerToken);
+  expect(otherResponse.status).toBe(201);
+  const other = (await otherResponse.json()).data;
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  for (const table of ["workspaces", "projects"]) expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  for (const [wid, pid] of [[other.id, project.id], [workspaceId, otherProject.id], [2147483647, project.id], [workspaceId, 2147483647]]) {
+    const response = await listStatuses(wid, pid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+});
+
+test("a failure creating default statuses rolls back the new project", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const constraint = `status_defaults_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(`ALTER TABLE project_statuses ADD CONSTRAINT ${constraint} CHECK (name <> 'Review') NOT VALID`);
+    const response = await createProjectInWorkspace(workspaceId, { name: "Failed status project", status: "active" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await workspaceProjects(workspaceId)).toEqual([]);
+    expect((await pool!.query("SELECT s.id FROM project_statuses s JOIN projects p ON p.id = s.project_id WHERE p.workspace_id = $1", [workspaceId])).rows).toEqual([]);
+  } finally {
+    await pool!.query(`ALTER TABLE project_statuses DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+async function createStatus(workspaceId: number | string, projectId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/statuses`, {
+    method: "POST", headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+  });
+}
+
+async function savedStatuses(projectId: number) {
+  return (await pool!.query("SELECT * FROM project_statuses WHERE project_id = $1 ORDER BY position, id", [projectId])).rows;
+}
+
+test.each(["owner", "editor"] as const)("an %s creates a custom status at the end without accepting injected IDs or position", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await createStatus(workspaceId, project.id, { name: "  Testing  ", id: -1, projectId: -1, userId: -1, position: -1 }, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(201);
+  const saved = await savedStatuses(project.id);
+  expect(saved.slice(0, 4)).toEqual(before);
+  expect(saved).toHaveLength(5);
+  const row = saved[4];
+  expect(await response.json()).toEqual({ data: {
+    id: row.id, projectId: project.id, name: "Testing", position: 5000, isDone: false,
+    createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(),
+  } });
+});
+
+test("custom statuses support completion flags and the allowed name-length boundaries", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  for (const [index, input] of [{ name: "X", isDone: true }, { name: "Y".repeat(50), isDone: false }].entries()) {
+    const response = await createStatus(workspaceId, project.id, input, ownerToken);
+    expect(response.status).toBe(201);
+    expect((await response.json()).data).toMatchObject({ projectId: project.id, ...input, position: 5000 + index * 1000 });
+  }
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot create statuses", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await createStatus(workspaceId, project.id, { name: "Forbidden status" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status creation requires authentication before validating IDs or body", async () => {
+  const response = await createStatus("invalid", "invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("status creation rejects malformed IDs and invalid fields without writes", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid"]) {
+      const response = await createStatus(field === "wid" ? invalid : workspaceId, field === "pid" ? invalid : project.id, { name: "Testing" }, ownerToken);
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  for (const body of [{}, { name: null }, { name: "" }, { name: "   " }, { name: "X".repeat(51) }, { name: 123 }, { name: [] }, { name: "Testing", isDone: "invalid" }, { name: "Testing", isDone: {} }]) {
+    const response = await createStatus(workspaceId, project.id, body, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors.length).toBeGreaterThan(0);
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status creation rejects missing and mismatched workspace/project pairs", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const created = await create({ name: "Other status creation workspace" }, ownerToken);
+  expect(created.status).toBe(201);
+  const other = (await created.json()).data;
+  const otherProject = await projectFixtureForHttp(other.id, ownerToken);
+  const before = await savedStatuses(project.id);
+  for (const table of ["workspaces", "projects"]) expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  for (const [wid, pid] of [[other.id, project.id], [workspaceId, otherProject.id], [2147483647, project.id], [workspaceId, 2147483647]]) {
+    const response = await createStatus(wid, pid, { name: "Wrong project status" }, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("duplicate names including trimmed default names return 409 without changing statuses", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  for (const name of ["Done", "  Review  "]) {
+    const response = await createStatus(workspaceId, project.id, { name, isDone: true }, ownerToken);
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("STATUS_ALREADY_EXISTS");
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("the same custom name is allowed in different projects", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const project of [await projectFixtureForHttp(workspaceId, ownerToken), await projectFixtureForHttp(workspaceId, ownerToken)]) {
+    const response = await createStatus(workspaceId, project.id, { name: "Testing" }, ownerToken);
+    expect(response.status).toBe(201);
+    expect((await response.json()).data).toMatchObject({ projectId: project.id, name: "Testing" });
+  }
+});
+
+test("an empty project's status list starts at position 1000", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  await pool!.query("DELETE FROM project_statuses WHERE project_id = $1", [project.id]);
+  const response = await createStatus(workspaceId, project.id, { name: "Initial status" }, ownerToken);
+  expect(response.status).toBe(201);
+  expect((await response.json()).data).toMatchObject({ position: 1000 });
+});
+
+test("simultaneous status creations append distinct positions", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const responses = await Promise.all([createStatus(workspaceId, project.id, { name: "Testing" }, ownerToken), createStatus(workspaceId, project.id, { name: "Released" }, ownerToken)]);
+  const bodies = [];
+  for (const response of responses) { expect(response.status).toBe(201); bodies.push((await response.json()).data); }
+  expect(bodies.map(row => row.position).sort((a, b) => a - b)).toEqual([5000, 6000]);
+  const listed = await listStatuses(workspaceId, project.id, ownerToken);
+  expect(listed.status).toBe(200);
+  expect((await listed.json()).data.map((row: { position: number }) => row.position)).toEqual([1000, 2000, 3000, 4000, 5000, 6000]);
+});
+
+test("simultaneous duplicate status creations commit exactly one new status", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const responses = await Promise.all([createStatus(workspaceId, project.id, { name: "Testing" }, ownerToken), createStatus(workspaceId, project.id, { name: " Testing " }, ownerToken)]);
+  expect(responses.map(response => response.status).sort()).toEqual([201, 409]);
+  for (const response of responses) {
+    const body = await response.json();
+    if (response.status === 409) expect(body.error.code).toBe("STATUS_ALREADY_EXISTS");
+  }
+  expect(await savedStatuses(project.id)).toHaveLength(5);
+});
+
+test.each(["demoted", "removed"])("a waiting status creation rechecks permission after its editor is %s", async change => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = (await locker.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = createStatus(workspaceId, project.id, { name: "Waiting status" }, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid);
+    await locker.query(change === "demoted" ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2" : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]]);
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await savedStatuses(project.id)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then(response => response.text()).catch(() => {});
+  }
+});
+
+test("failed status inserts leave existing statuses unchanged", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const constraint = `custom_status_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(`ALTER TABLE project_statuses ADD CONSTRAINT ${constraint} CHECK (name <> 'Rejected status') NOT VALID`);
+    const response = await createStatus(workspaceId, project.id, { name: "Rejected status" }, ownerToken);
+    expect(response.status).toBe(500);
+    await response.json();
+    expect(await savedStatuses(project.id)).toEqual(before);
+  } finally {
+    await pool!.query(`ALTER TABLE project_statuses DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+async function editStatus(workspaceId: number | string, projectId: number | string, statusId: number | string, body: unknown, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/statuses/${statusId}`, {
+    method: "PATCH", headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(5000),
+  });
+}
+
+function statusApiRow(row: Record<string, any>) {
+  return { id: row.id, projectId: row.project_id, name: row.name, position: row.position, isDone: row.is_done,
+    createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString() };
+}
+
+test.each(["owner", "editor"] as const)("an %s can edit status fields without changing its identity or project", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const status = before[3];
+  await pool!.query("UPDATE project_statuses SET updated_at = '2000-01-01' WHERE id = $1", [status.id]);
+  const response = await editStatus(workspaceId, project.id, status.id, { name: "  Released  ", position: 0, isDone: false, id: -1, projectId: -1, createdAt: "2000-01-01", actorId: -1 }, role === "owner" ? ownerToken : otherToken);
+  expect(response.status).toBe(200);
+  const saved = await savedStatuses(project.id);
+  const updated = saved.find(row => row.id === status.id)!;
+  expect(updated).toEqual({ ...status, name: "Released", position: 0, is_done: false, updated_at: expect.any(Date) });
+  expect(updated.updated_at.getTime()).toBeGreaterThan(new Date("2000-01-01").getTime());
+  expect(saved.filter(row => row.id !== status.id)).toEqual(before.filter(row => row.id !== status.id));
+  expect(await response.json()).toEqual({ data: statusApiRow(updated) });
+});
+
+test("status edits preserve omitted fields and status lists follow updated positions", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const initial = (await savedStatuses(project.id))[0];
+  const renamed = await editStatus(workspaceId, project.id, initial.id, { name: "New backlog" }, ownerToken);
+  expect(renamed.status).toBe(200);
+  expect((await renamed.json()).data).toMatchObject({ name: "New backlog", position: 1000, isDone: false });
+  const flagged = await editStatus(workspaceId, project.id, initial.id, { isDone: true }, ownerToken);
+  expect(flagged.status).toBe(200);
+  expect((await flagged.json()).data).toMatchObject({ name: "New backlog", position: 1000, isDone: true });
+  const moved = await editStatus(workspaceId, project.id, initial.id, { position: "5000" }, ownerToken);
+  expect(moved.status).toBe(200);
+  expect((await moved.json()).data).toMatchObject({ name: "New backlog", position: 5000, isDone: true });
+  const listed = await listStatuses(workspaceId, project.id, ownerToken);
+  expect(listed.status).toBe(200);
+  expect((await listed.json()).data.map((row: { position: number }) => row.position)).toEqual([2000, 3000, 4000, 5000]);
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot edit statuses", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await editStatus(workspaceId, project.id, before[0].id, { name: "Denied edit" }, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status editing authenticates before validating route and body", async () => {
+  const response = await editStatus("invalid", "invalid", "invalid", {});
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("status edits validate every route ID and field without partial writes", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid", "sid"]) {
+      const response = await editStatus(field === "wid" ? invalid : workspaceId, field === "pid" ? invalid : project.id, field === "sid" ? invalid : before[0].id, { name: "Valid edit" }, ownerToken);
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  for (const [field, value] of [["name", ""], ["name", "  "], ["name", "X".repeat(51)], ["name", 123], ["position", -1], ["position", 1.5], ["position", 2147483648], ["position", "invalid"], ["isDone", "invalid"], ["isDone", {}]] as const) {
+    const response = await editStatus(workspaceId, project.id, before[0].id, { name: "Valid edit", [field]: value }, ownerToken);
+    expect(response.status).toBe(422);
+    expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test.each([{}, { id: 99, projectId: 99 }, { name: null }, { position: null }, { isDone: null }])("empty status edits are rejected: %j", async body => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await editStatus(workspaceId, project.id, before[0].id, body, ownerToken);
+  expect(response.status).toBe(422);
+  expect((await response.json()).error.code).toBe("EMPTY_UPDATE");
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status edits reject mismatched hierarchy and missing resources", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const otherResponse = await create({ name: "Other status edit workspace" }, ownerToken);
+  expect(otherResponse.status).toBe(201);
+  const other = (await otherResponse.json()).data;
+  for (const table of ["workspaces", "projects", "project_statuses"]) expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  for (const [wid, pid, sid] of [[workspaceId, sibling.id, before[0].id], [other.id, project.id, before[0].id], [2147483647, project.id, before[0].id], [workspaceId, 2147483647, before[0].id], [workspaceId, project.id, 2147483647]]) {
+    const response = await editStatus(wid, pid, sid, { name: "Wrong status edit" }, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("duplicate-name status edits return 409 and roll back all fields", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await editStatus(workspaceId, project.id, before[0].id, { name: " Review ", position: 0, isDone: true }, ownerToken);
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: { code: "STATUS_ALREADY_EXISTS", message: "A status with this name already exists", requestId: expect.any(String) } });
+  expect(await savedStatuses(project.id)).toEqual(before);
+  const retained = await editStatus(workspaceId, project.id, before[0].id, { name: before[0].name, isDone: true }, ownerToken);
+  expect(retained.status).toBe(200);
+  await retained.json();
+});
+
+test("status edits allow the same name in different projects", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  for (const project of [await projectFixtureForHttp(workspaceId, ownerToken), await projectFixtureForHttp(workspaceId, ownerToken)]) {
+    const initial = (await savedStatuses(project.id))[0];
+    const response = await editStatus(workspaceId, project.id, initial.id, { name: "Shared status name" }, ownerToken);
+    expect(response.status).toBe(200);
+    expect((await response.json()).data).toMatchObject({ projectId: project.id, name: "Shared status name" });
+  }
+});
+
+test("competing status renames commit one winner without changing the loser", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const responses = await Promise.all([editStatus(workspaceId, project.id, before[0].id, { name: "Contested name", position: 8000 }, ownerToken), editStatus(workspaceId, project.id, before[1].id, { name: "Contested name", position: 9000 }, ownerToken)]);
+  expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+  const saved = await savedStatuses(project.id);
+  for (const [index, response] of responses.entries()) {
+    const body = await response.json();
+    if (response.status === 409) {
+      expect(body.error.code).toBe("STATUS_ALREADY_EXISTS");
+      expect(saved.find(row => row.id === before[index].id)).toEqual(before[index]);
+    } else expect(body.data).toMatchObject({ id: before[index].id, name: "Contested name" });
+  }
+  expect(saved.filter(row => row.name === "Contested name")).toHaveLength(1);
+});
+
+test.each(["demoted", "removed"])("a waiting status edit rechecks permission after its editor is %s", async change => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = (await locker.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = editStatus(workspaceId, project.id, before[0].id, { name: "Waiting edit" }, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid);
+    await locker.query(change === "demoted" ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2" : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]]);
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await savedStatuses(project.id)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then(response => response.text()).catch(() => {});
+  }
+});
+
+test("status edits accept boundary values and subsequent appends fail clearly if ordering is full", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const status = (await savedStatuses(project.id))[0];
+  for (const [name, position] of [["X", 0], ["Y".repeat(50), 2147483647]] as const) {
+    const response = await editStatus(workspaceId, project.id, status.id, { name, position }, ownerToken);
+    expect(response.status).toBe(200);
+    expect((await response.json()).data).toMatchObject({ name, position });
+  }
+  const before = await savedStatuses(project.id);
+  const appended = await createStatus(workspaceId, project.id, { name: "No available order" }, ownerToken);
+  expect(appended.status).toBe(409);
+  expect((await appended.json()).error.code).toBe("STATUS_ORDER_LIMIT");
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+async function deleteStatus(workspaceId: number | string, projectId: number | string, statusId: number | string, token?: string) {
+  return fetch(`${baseUrl}/workspaces/${workspaceId}/projects/${projectId}/statuses/${statusId}`, {
+    method: "DELETE", headers: token ? { authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(5000),
+  });
+}
+
+test.each(["owner", "editor"] as const)("an %s deletes unused statuses without changing sibling statuses", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const token = role === "owner" ? ownerToken : otherToken;
+  const response = await deleteStatus(workspaceId, project.id, before[0].id, token);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect(await savedStatuses(project.id)).toEqual(before.slice(1));
+  const repeated = await deleteStatus(workspaceId, project.id, before[0].id, token);
+  expect(repeated.status).toBe(404);
+  expect((await repeated.json()).error.code).toBe("NOT_FOUND");
+  expect(await savedStatuses(project.id)).toEqual(before.slice(1));
+});
+
+test.each(["viewer", "outsider"] as const)("a %s cannot delete statuses", async role => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture(role);
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const response = await deleteStatus(workspaceId, project.id, before[0].id, otherToken);
+  expect(response.status).toBe(role === "viewer" ? 403 : 404);
+  expect((await response.json()).error.code).toBe(role === "viewer" ? "FORBIDDEN" : "NOT_FOUND");
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status deletion requires authentication before route validation", async () => {
+  const response = await deleteStatus("invalid", "invalid", "invalid");
+  expect(response.status).toBe(401);
+  await response.text();
+});
+
+test("status deletion validates every route ID without changes", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  for (const invalid of ["abc", "0", "-1", "1.5", "2147483648"]) {
+    for (const field of ["wid", "pid", "sid"]) {
+      const response = await deleteStatus(field === "wid" ? invalid : workspaceId, field === "pid" ? invalid : project.id, field === "sid" ? invalid : before[0].id, ownerToken);
+      expect(response.status).toBe(422);
+      expect((await response.json()).errors).toEqual(expect.arrayContaining([expect.objectContaining({ field })]));
+    }
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("status deletion rejects missing and mismatched workspace/project/status resources", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const sibling = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const otherResponse = await create({ name: "Other status delete workspace" }, ownerToken);
+  expect(otherResponse.status).toBe(201);
+  const other = (await otherResponse.json()).data;
+  for (const table of ["workspaces", "projects", "project_statuses"]) expect((await pool!.query(`SELECT id FROM ${table} WHERE id = 2147483647`)).rows).toEqual([]);
+  for (const [wid, pid, sid] of [[workspaceId, sibling.id, before[0].id], [other.id, project.id, before[0].id], [2147483647, project.id, before[0].id], [workspaceId, 2147483647, before[0].id], [workspaceId, project.id, 2147483647]]) {
+    const response = await deleteStatus(wid, pid, sid, ownerToken);
+    expect(response.status).toBe(404);
+    expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedStatuses(project.id)).toEqual(before);
+});
+
+test("referenced incomplete and complete statuses require moving tasks before deletion", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const initial = await savedStatuses(project.id);
+  for (const status of [initial[0], initial[3]]) {
+    const task = await insertTaskFixture(project.id, "Status deletion reference");
+    await pool!.query("UPDATE tasks SET status_id = $1 WHERE id = $2", [status.id, task.id]);
+    const statusesBefore = await savedStatuses(project.id);
+    const tasksBefore = await savedProjectTasks(project.id);
+    const rejected = await deleteStatus(workspaceId, project.id, status.id, ownerToken);
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toEqual({ error: { code: "STATUS_IN_USE", message: "Move tasks to another status before deleting this status", requestId: expect.any(String) } });
+    expect(await savedStatuses(project.id)).toEqual(statusesBefore);
+    expect(await savedProjectTasks(project.id)).toEqual(tasksBefore);
+    await pool!.query("UPDATE tasks SET status_id = $1 WHERE id = $2", [initial[1].id, task.id]);
+    const moved = await savedProjectTasks(project.id);
+    const deleted = await deleteStatus(workspaceId, project.id, status.id, ownerToken);
+    expect(deleted.status).toBe(204);
+    expect(await deleted.text()).toBe("");
+    expect(await savedProjectTasks(project.id)).toEqual(moved);
+  }
+});
+
+test("simultaneous deletions remove the status once and leave siblings intact", async () => {
+  const { workspaceId, ownerToken } = await ownershipFixture();
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const responses = await Promise.all([deleteStatus(workspaceId, project.id, before[0].id, ownerToken), deleteStatus(workspaceId, project.id, before[0].id, ownerToken)]);
+  expect(responses.map(response => response.status).sort()).toEqual([204, 404]);
+  for (const response of responses) {
+    if (response.status === 204) expect(await response.text()).toBe("");
+    else expect((await response.json()).error.code).toBe("NOT_FOUND");
+  }
+  expect(await savedStatuses(project.id)).toEqual(before.slice(1));
+});
+
+test.each(["demoted", "removed"])("a waiting status deletion rechecks permission after its editor is %s", async change => {
+  const { workspaceId, ownerToken, otherToken } = await ownershipFixture("editor");
+  const project = await projectFixtureForHttp(workspaceId, ownerToken);
+  const before = await savedStatuses(project.id);
+  const locker = await pool!.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("BEGIN");
+    const pid = (await locker.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    await locker.query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE", [workspaceId]);
+    pending = deleteStatus(workspaceId, project.id, before[0].id, otherToken);
+    void pending.catch(() => {});
+    await waitForDatabaseBlocker(pid);
+    await locker.query(change === "demoted" ? "UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = $1 AND user_id = $2" : "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userIds[1]]);
+    await locker.query("COMMIT");
+    const response = await pending;
+    expect(response.status).toBe(change === "demoted" ? 403 : 404);
+    await response.json();
+    expect(await savedStatuses(project.id)).toEqual(before);
+  } finally {
+    try { await locker.query("ROLLBACK"); } finally { locker.release(); }
+    if (pending) await pending.then(response => response.text()).catch(() => {});
+  }
+});
+
 async function list(token: string, afterId?: number) {
   const url = new URL("/workspaces", baseUrl);
 

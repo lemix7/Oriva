@@ -112,3 +112,13 @@ test("unrelated unique constraints remain server errors", () => {
   expect(res.status).toHaveBeenCalledWith(500);
   expect(res.json).toHaveBeenCalledWith({ success: false, message: "Internal server error", requestId: "test-request-id" });
 });
+
+test.each([false, true])("status-name conflicts return a safe 409 response (wrapped: %s)", wrapped => {
+  const databaseError = Object.assign(new Error("sensitive SQL values"), { code: "23505", constraint: "project_statuses_project_name_unique" });
+  const error = wrapped ? Object.assign(new Error("SQL statement"), { cause: databaseError }) : databaseError;
+  const res = response();
+  errorHandling(error, {} as Request, res as unknown as Response, jest.fn());
+  expect(res.status).toHaveBeenCalledWith(409);
+  expect(res.json).toHaveBeenCalledWith({ error: { code: "STATUS_ALREADY_EXISTS", message: "A status with this name already exists", requestId: "test-request-id" } });
+  expect(errorLog).not.toHaveBeenCalled();
+});

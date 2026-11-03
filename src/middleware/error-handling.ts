@@ -2,7 +2,10 @@ import { type Request, type Response, type NextFunction } from "express";
 import { errors } from "@vinejs/vine";
 import { MulterError } from "multer";
 import { AppError } from "../shared/app-error.ts";
-import { isDuplicateEmailError } from "../shared/database-errors.ts";
+import {
+  isDuplicateEmailError,
+  isDuplicateProjectStatusNameError,
+} from "../shared/database-errors.ts";
 
 const errorHandling = function (
   err: Error,
@@ -31,6 +34,16 @@ const errorHandling = function (
       error: {
         code: "EMAIL_ALREADY_EXISTS",
         message: "Email is already in use",
+        requestId,
+      },
+    });
+  }
+
+  if (isDuplicateProjectStatusNameError(err)) {
+    return res.status(409).json({
+      error: {
+        code: "STATUS_ALREADY_EXISTS",
+        message: "A status with this name already exists",
         requestId,
       },
     });

@@ -146,6 +146,22 @@ requests. Read and modify projects only through `/workspaces/:wid/projects`.
 
 Project creation accepts `name` (at least 3 characters), optional `description`, and `status`: `active`, `inactive`, `pending`, or `completed`.
 
+### Project task statuses
+
+- `GET /workspaces/:wid/projects/:pid/statuses` — lists statuses for members.
+- `POST /workspaces/:wid/projects/:pid/statuses` — creates a status.
+- `PATCH /workspaces/:wid/projects/:pid/statuses/:sid` — edits a status.
+- `DELETE /workspaces/:wid/projects/:pid/statuses/:sid` — deletes an unused status.
+
+Creation, editing, and deletion require owner/editor membership.
+Duplicate names return `409 STATUS_ALREADY_EXISTS`.
+Statuses referenced by tasks return `409 STATUS_IN_USE` on deletion.
+Appending beyond the integer position range returns `409 STATUS_ORDER_LIMIT`.
+
+New projects receive Backlog, In Progress, Review, and Done.
+Tasks still use the legacy status text during this transition;
+switching the task API to `statusId` is the next implementation slice.
+
 ### Workspace task endpoints
 
 All task endpoints require workspace membership.
@@ -340,15 +356,17 @@ It does not create the database or run migrations.
 
 The seed creates a Demo Owner (`demo.owner@example.com`, local demo password
 `LocalDemo123!`), one Demo Workspace with an owner membership, one active Demo
-Project linked to that workspace, and two tasks: Plan the project (done)
+Project linked to that workspace, four default task statuses (Backlog, In Progress,
+Review, Done), and two tasks: Plan the project (done)
 and Build the first feature (on progress). The password is stored as a bcrypt
-hash. New projects/tasks use January 1, 2026 as their creation date. IDs remain
+hash. New projects, statuses, and tasks use January 1, 2026 as their creation date. IDs remain
 database-generated.
 
 All inserts commit together or roll back on failure. A transaction-scoped lock
 serializes simultaneous seed runs. Reruns reuse demo records by email,
 creator/workspace name, workspace/creator/project name, and project/task title,
-preserving edits, existing membership roles, and passwords;
+preserving edits, existing membership roles, passwords, and existing statuses
+matched by project/name;
 missing demo records are recreated. Renaming those identifying fields makes
 the original demo record missing, so the next run recreates it. The script
 does not delete records, send email, access Redis/S3, or connect to Neon.
