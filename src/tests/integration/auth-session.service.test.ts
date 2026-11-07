@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "@jest/globals";
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import bcrypt from "bcryptjs";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
 import type { Pool } from "pg";
@@ -8,6 +9,7 @@ import { hashRefreshToken } from "../../shared/refresh-token.ts";
 
 let pool: Pool | undefined;
 let service: typeof import("../../services/auth-session.service.ts");
+let changePassword: typeof import("../../services/password.service.ts").changeCurrentUserPassword;
 const originalUrl = process.env.DATABASE_URL;
 const originalSecret = process.env.SECRET_KEY;
 const testSecret = "session-integration-test-secret";
@@ -21,6 +23,7 @@ beforeAll(async () => {
   process.env.SECRET_KEY = testSecret;
   ({ default: pool } = await import("../../pool/pooler.ts"));
   service = await import("../../services/auth-session.service.ts");
+  ({ changeCurrentUserPassword: changePassword } = await import("../../services/password.service.ts"));
 });
 beforeEach(async () => {
   userIds = [];
@@ -208,4 +211,65 @@ test("the database rejects duplicate token hashes", async () => {
   await expect(pool!.query("INSERT INTO refresh_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)", [userIds[0], before[0].token_hash, before[0].expires_at]))
     .rejects.toMatchObject({ code: "23505", constraint: "refresh_sessions_token_hash_unique" });
   expect(await rows()).toEqual(before);
+});
+
+const currentPassword = "integration-test-password";
+
+async function loginWithPassword() {
+  const passwordHash = await bcrypt.hash(currentPassword, 8);
+  await pool!.query("UPDATE users SET password = $1 WHERE id = $2", [passwordHash, userIds[0]]);
+  return service.createLoginSession(userIds[0], passwordHash);
+}
+
+async function readPasswordHash() {
+  return (await pool!.query("SELECT password FROM users WHERE id = $1", [userIds[0]])).rows[0].password as string;
+}
+
+test("a failed session revocation rolls back the password change", async () => {
+  await loginWithPassword();
+  const originalHash = await readPasswordHash();
+  const originalSessions = await rows();
+  const constraint = `password_revocation_failure_${randomUUID().replace(/-/g, "")}`;
+  try {
+    await pool!.query(`ALTER TABLE refresh_sessions ADD CONSTRAINT ${constraint} CHECK (user_id <> ${userIds[0]} OR revoked_at IS NULL) NOT VALID`);
+    await expect(changePassword(userIds[0], currentPassword, "replacement-password"))
+      .rejects.toMatchObject({ cause: { code: "23514", constraint } });
+    expect(await readPasswordHash()).toBe(originalHash);
+    expect(await rows()).toEqual(originalSessions);
+  } finally {
+    await pool!.query(`ALTER TABLE refresh_sessions DROP CONSTRAINT IF EXISTS ${constraint}`);
+  }
+});
+
+test("concurrent changes using the same current password succeed only once", async () => {
+  await loginWithPassword();
+  const replacements = ["first-replacement", "second-replacement"];
+  const results = await Promise.allSettled(
+    replacements.map(replacement => changePassword(userIds[0], currentPassword, replacement)),
+  );
+  const winner = results.findIndex(result => result.status === "fulfilled");
+  expect(winner).toBeGreaterThanOrEqual(0);
+  expect(results[1 - winner]).toMatchObject({
+    status: "rejected",
+    reason: { statusCode: 422, code: "INVALID_CURRENT_PASSWORD" },
+  });
+  await expect(bcrypt.compare(replacements[winner], await readPasswordHash())).resolves.toBe(true);
+});
+
+test("refresh racing a password change leaves no active session for that account", async () => {
+  const original = await loginWithPassword();
+  const alreadyRevoked = await service.createLoginSession(userIds[0], await readPasswordHash());
+  await service.logoutSession(alreadyRevoked.refreshToken);
+  const oldRevocation = (await rows())[1].revoked_at;
+  const [changed, refreshed] = await Promise.allSettled([
+    changePassword(userIds[0], currentPassword, "replacement-password"),
+    service.rotateRefreshSession(original.refreshToken),
+  ]);
+  expect(changed.status).toBe("fulfilled");
+  if (refreshed.status === "rejected") {
+    expect(refreshed.reason).toMatchObject({ statusCode: 401 });
+  }
+  const saved = await rows();
+  expect(saved.every(row => row.revoked_at instanceof Date)).toBe(true);
+  expect(saved[1].revoked_at).toEqual(oldRevocation);
 });
