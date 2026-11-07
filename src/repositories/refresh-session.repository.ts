@@ -95,3 +95,19 @@ export async function revokeRefreshFamily(
       ),
     );
 }
+
+export async function revokeAllRefreshSessions(
+  tx: Transaction,
+  userId: number,
+  now: Date,
+) {
+  await tx
+    .update(refreshSessions)
+    .set({ revokedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(refreshSessions.userId, userId),
+        isNull(refreshSessions.revokedAt),
+      ),
+    );
+}

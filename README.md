@@ -142,6 +142,7 @@ Authentication responses are marked `Cache-Control: no-store`.
 
 - `GET /me` — returns the authenticated user's ID, name, and email.
 - `PATCH /me` — updates their name and/or email.
+- `PATCH /me/password` requires a Bearer access token and a JSON body with `currentPassword` and `newPassword`. On success, it returns `204`, clears the refresh cookie, and revokes all refresh sessions for the account. The client should discard its access token and prompt the user to sign in again. Previously issued access tokens remain valid until they expire. The endpoint allows five attempts per account every 15 minutes after input validation.
 
 Emails are trimmed, lowercased, and unique after applying migration
 `0006_unique-user-email`. Duplicate registration or email updates return

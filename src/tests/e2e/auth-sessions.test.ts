@@ -228,3 +228,134 @@ test("wrong JWT algorithms and malformed bearer prefixes return 401", async () =
   const malformed = await fetch(`${baseUrl}/me`, { headers: { authorization: `BearerX${valid.token}` }, signal: AbortSignal.timeout(5000) });
   expect(malformed.status).toBe(401); await malformed.text();
 });
+
+const newPassword = "  updated-test-password  ";
+
+function changePassword(options: Omit<NonNullable<Parameters<typeof request>[1]>, "method"> = {}) {
+  return request("/me/password", {
+    method: "PATCH",
+    body: { currentPassword: password, newPassword },
+    ...options,
+  });
+}
+
+test("changing a password updates login and revokes only the authenticated account's sessions", async () => {
+  const signedIn = await login();
+  const secondDevice = await login();
+  const otherUser = await login(emails[1]);
+  const rotated = await request("/auth/refresh", { cookie: signedIn.cookie });
+  expect(rotated.status).toBe(200);
+  await rotated.json();
+  const replacement = cookieFrom(rotated);
+
+  const changed = await changePassword({
+    origin: null,
+    token: signedIn.token,
+    cookie: replacement,
+    body: { currentPassword: password, newPassword, userId: userIds[1] },
+  });
+  expect(changed.status).toBe(204);
+  expect(await changed.text()).toBe("");
+  expect(changed.headers.get("set-cookie")).toMatch(/^oriva_refresh=;/);
+  expect(changed.headers.get("cache-control")).toBe("no-store");
+
+  const saved = await sessions();
+  const ownSessions = saved.filter(row => row.user_id === userIds[0]);
+  expect(ownSessions).toHaveLength(3);
+  expect(ownSessions.every(row => row.revoked_at instanceof Date)).toBe(true);
+  expect(saved.filter(row => row.user_id === userIds[1])).toEqual([
+    expect.objectContaining({ revoked_at: null }),
+  ]);
+  for (const cookie of [signedIn.cookie, replacement, secondDevice.cookie]) {
+    const denied = await request("/auth/refresh", { cookie });
+    expect(denied.status).toBe(401);
+    await denied.json();
+  }
+  const unaffected = await request("/auth/refresh", { cookie: otherUser.cookie });
+  expect(unaffected.status).toBe(200);
+  await unaffected.json();
+
+  for (const rejectedPassword of [password, newPassword.trim()]) {
+    const denied = await request("/login", { body: { email: emails[0], password: rejectedPassword } });
+    expect(denied.status).toBe(401);
+    await denied.text();
+  }
+  const signedInAgain = await request("/login", { body: { email: emails[0], password: newPassword } });
+  expect(signedInAgain.status).toBe(200);
+  await signedInAgain.json();
+  await login(emails[1]);
+
+  const profile = await request("/me", { method: "GET", token: signedIn.token });
+  expect(profile.status).toBe(200);
+  await profile.json();
+  const logs = JSON.stringify([requestLog.mock.calls, errorLog.mock.calls]);
+  expect(logs).not.toContain(password);
+  expect(logs).not.toContain(newPassword);
+});
+
+test("a refresh cookie or an expired access token cannot authorize a password change", async () => {
+  const signedIn = await login();
+  const before = await sessions();
+  const expired = jwt.sign({ userId: userIds[0] }, secret, { algorithm: "HS256", expiresIn: -1 });
+  for (const token of [undefined, expired]) {
+    const denied = await changePassword({ token, cookie: signedIn.cookie });
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get("set-cookie")).toBeNull();
+    await denied.text();
+  }
+  expect(await sessions()).toEqual(before);
+});
+
+test.each([
+  {},
+  { currentPassword: password },
+  { currentPassword: 12345678, newPassword },
+  { currentPassword: password, newPassword: "short" },
+  { currentPassword: password, newPassword: "a".repeat(73) },
+])("rejects invalid password-change input without clearing the cookie", async body => {
+  const signedIn = await login();
+  const response = await changePassword({ token: signedIn.token, cookie: signedIn.cookie, body });
+  expect(response.status).toBe(422);
+  expect(response.headers.get("set-cookie")).toBeNull();
+  expect(await response.json()).toMatchObject({ message: "Validation failed" });
+});
+
+test("bcrypt's password limit is enforced in UTF-8 bytes", async () => {
+  const signedIn = await login();
+  const tooLong = await changePassword({
+    token: signedIn.token,
+    body: { currentPassword: password, newPassword: "é".repeat(37) },
+  });
+  expect(tooLong.status).toBe(422);
+  expect((await tooLong.json()).error.code).toBe("PASSWORD_TOO_LONG");
+  expect(tooLong.headers.get("set-cookie")).toBeNull();
+
+  const maxLength = await changePassword({
+    token: signedIn.token,
+    body: { currentPassword: password, newPassword: "é".repeat(36) },
+  });
+  expect(maxLength.status).toBe(204);
+});
+
+test("five wrong password attempts leave credentials intact and rate-limit only that account", async () => {
+  const signedIn = await login();
+  const otherUser = await login(emails[1]);
+  const before = await sessions();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const response = await changePassword({
+      token: signedIn.token,
+      cookie: signedIn.cookie,
+      body: { currentPassword: "wrong-password", newPassword },
+    });
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("INVALID_CURRENT_PASSWORD");
+    expect(response.headers.get("set-cookie")).toBeNull();
+  }
+  const limited = await changePassword({ token: signedIn.token });
+  expect(limited.status).toBe(429);
+  expect((await limited.json()).error.code).toBe("RATE_LIMITED");
+  expect(limited.headers.get("set-cookie")).toBeNull();
+  expect(await sessions()).toEqual(before);
+  await login();
+  expect((await changePassword({ token: otherUser.token })).status).toBe(204);
+});

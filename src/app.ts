@@ -31,6 +31,9 @@ import {
   refreshSessionController,
   logoutSessionController,
 } from "./controllers/auth-session.controller.ts";
+import { changePasswordController } from "./controllers/password.controller.ts";
+import { changePasswordValidator } from "./validators/password-change.validator.ts";
+import passwordChangeRateLimit from "./middleware/password-change-rate-limit.ts";
 
 const app: Express = express();
 
@@ -68,6 +71,12 @@ app.post("/auth/logout", requireTrustedOrigin, logoutSessionController);
 app.use(authenticateJWT);
 
 // Protected endpoints
+app.patch(
+  "/me/password",
+  validate(changePasswordValidator, messageProvider),
+  passwordChangeRateLimit,
+  changePasswordController,
+);
 app.get("/me", getMeController);
 app.patch(
   "/me",

@@ -26,8 +26,14 @@ export async function findUserByEmail(
   return user ?? null;
 }
 
-export async function insertUser(name: string, email: string, pass: string, key: string | null) {
-  const [user] = await db.insert(users)
+export async function insertUser(
+  name: string,
+  email: string,
+  pass: string,
+  key: string | null,
+) {
+  const [user] = await db
+    .insert(users)
     .values({ name, email, password: pass, profilePicKey: key })
     .returning(userFields);
   return user;
@@ -68,4 +74,20 @@ export async function updateUserProfile(
     });
 
   return user;
+}
+
+type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export async function updateUserPassword(
+  tx: Transaction,
+  userId: number,
+  passwordHash: string,
+) {
+  const [user] = await tx
+    .update(users)
+    .set({ password: passwordHash })
+    .where(eq(users.id, userId))
+    .returning({ id: users.id });
+
+  return user ?? null;
 }
