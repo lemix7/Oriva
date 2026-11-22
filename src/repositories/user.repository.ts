@@ -59,8 +59,9 @@ export async function updateUserProfile(
     name?: string;
     email?: string;
   },
+  executor: typeof db | Transaction = db,
 ) {
-  const [user] = await db
+  const [user] = await executor
     .update(users)
     .set({
       name: changes.name,
@@ -91,3 +92,4 @@ export async function updateUserPassword(
 
   return user ?? null;
 }
+

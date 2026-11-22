@@ -34,6 +34,19 @@ import {
 import { changePasswordController } from "./controllers/password.controller.ts";
 import { changePasswordValidator } from "./validators/password-change.validator.ts";
 import passwordChangeRateLimit from "./middleware/password-change-rate-limit.ts";
+import {
+  forgotPasswordController,
+  resetPasswordController,
+} from "./controllers/password-reset.controller.ts";
+import {
+  forgotPasswordValidator,
+  resetPasswordValidator,
+} from "./validators/password-reset.validator.ts";
+import {
+  forgotPasswordIpLimit,
+  forgotPasswordEmailLimit,
+  resetPasswordLimit,
+} from "./middleware/password-reset-rate-limit.ts";
 
 const app: Express = express();
 
@@ -67,6 +80,24 @@ app.get("/error", (req: Request, res: Response) => {
 app.post("/auth/refresh", requireTrustedOrigin, refreshSessionController);
 
 app.post("/auth/logout", requireTrustedOrigin, logoutSessionController);
+
+// RESET PASSWORD ENDPOINTS
+app.post(
+  "/auth/forgot-password",
+  forgotPasswordIpLimit,
+  requireTrustedOrigin,
+  validate(forgotPasswordValidator, messageProvider),
+  forgotPasswordEmailLimit,
+  forgotPasswordController,
+);
+
+app.post(
+  "/auth/reset-password",
+  resetPasswordLimit,
+  requireTrustedOrigin,
+  validate(resetPasswordValidator, messageProvider),
+  resetPasswordController,
+);
 
 app.use(authenticateJWT);
 

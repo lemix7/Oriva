@@ -15,19 +15,23 @@ jest.unstable_mockModule("dotenv", () => ({
 
 const originalApiKey = process.env.RESEND_API_KEY;
 const originalEmailFrom = process.env.EMAIL_FROM;
+const originalOrigin = process.env.APP_ORIGIN;
 process.env.RESEND_API_KEY = "unit-test-resend-key";
-const { default: newUserEmail, sendInvitationEmail } = await import("../services/email.service.ts");
+const { default: newUserEmail, sendInvitationEmail, sendPasswordResetEmail } = await import("../services/email.service.ts");
 
 afterAll(() => {
   if (originalApiKey === undefined) delete process.env.RESEND_API_KEY;
   else process.env.RESEND_API_KEY = originalApiKey;
   if (originalEmailFrom === undefined) delete process.env.EMAIL_FROM;
   else process.env.EMAIL_FROM = originalEmailFrom;
+  if (originalOrigin === undefined) delete process.env.APP_ORIGIN;
+  else process.env.APP_ORIGIN = originalOrigin;
 });
 
 beforeEach(() => {
   send.mockReset();
   process.env.EMAIL_FROM = "Oriva <invite@test.local>";
+  process.env.APP_ORIGIN = "https://oriva.test";
 });
 
 test("invitation email uses the recipient, configured sender, token, and idempotency key", async () => {
@@ -92,6 +96,53 @@ test("invalid credentials cause an unrecoverable failure", async () => {
     .rejects.toBeInstanceOf(UnrecoverableError);
 
   expect(send).toHaveBeenCalledTimes(1);
+});
+
+test("reset delivery builds the link from the configured frontend and preserves its idempotency key", async () => {
+  send.mockResolvedValue({ data: { id: "reset-delivered" }, error: null });
+  await expect(sendPasswordResetEmail("sara@test.local", "reset-test-token", "reset/1"))
+    .resolves.toEqual({ id: "reset-delivered" });
+  expect(send).toHaveBeenCalledWith({
+    from: "Oriva <invite@test.local>",
+    to: "sara@test.local",
+    subject: "Reset your Oriva password",
+    text: expect.stringContaining("https://oriva.test/reset-password?token=reset-test-token"),
+  }, { idempotencyKey: "reset/1", signal: expect.any(AbortSignal) });
+  expect((send.mock.calls[0][0] as { text: string }).text).toContain("15 minutes");
+});
+
+test.each(["EMAIL_FROM", "APP_ORIGIN"])("reset delivery rejects missing %s before provider access", async key => {
+  delete process.env[key];
+  await expect(sendPasswordResetEmail("sara@test.local", "reset-token", "reset/1"))
+    .rejects.toThrow(`Missing required environment variable: ${key}`);
+  expect(send).not.toHaveBeenCalled();
+});
+
+test.each([503, 408, 429])("reset delivery allows a retry after provider status %s", async statusCode => {
+  send.mockResolvedValue({ data: null, error: {
+    name: statusCode === 429 ? "rate_limit_exceeded" : "application_error",
+    statusCode, message: "Temporary provider failure",
+  } });
+  const pending = sendPasswordResetEmail("sara@test.local", "reset-token", "reset/1");
+  await expect(pending).rejects.toThrow("Temporary provider failure");
+  await expect(pending).rejects.not.toBeInstanceOf(UnrecoverableError);
+});
+
+test("reset delivery stops retrying permanent provider failures", async () => {
+  send.mockResolvedValue({ data: null, error: {
+    name: "validation_error", statusCode: 422, message: "Invalid recipient",
+  } });
+  await expect(sendPasswordResetEmail("sara@test.local", "reset-token", "reset/1"))
+    .rejects.toBeInstanceOf(UnrecoverableError);
+});
+
+test("reset delivery propagates network failures and rejects empty provider results", async () => {
+  send.mockRejectedValueOnce(new Error("Network unavailable"));
+  await expect(sendPasswordResetEmail("sara@test.local", "reset-token", "reset/1"))
+    .rejects.toThrow("Network unavailable");
+  send.mockResolvedValue({ data: null, error: null });
+  await expect(sendPasswordResetEmail("sara@test.local", "reset-token", "reset/1"))
+    .rejects.toThrow("Email provider returned no result");
 });
 
 test("email service cannot initialize without its API key", async () => {

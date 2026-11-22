@@ -6,6 +6,7 @@ A project and task management REST API built with Express, TypeScript, and Postg
 
 - User registration with bcrypt password hashing and optional profile pictures.
 - JWT authentication with 15-minute access tokens and rotating seven-day refresh sessions.
+- Password changes and emailed password resets with expiring, single-use tokens.
 - Create, read, update, and delete projects and tasks.
 - Project and task access scoped to workspace membership and roles.
 - Request body validation with VineJS.
@@ -45,6 +46,7 @@ AWS_ACCESS_KEY_ID=your-aws-access-key-id
 AWS_SECRET_ACCESS_KEY=your-aws-secret-access-key
 AWS_BUCKET_NAME=your-bucket-name
 RESEND_API_KEY=your-resend-api-key
+EMAIL_FROM=Oriva <hello@your-verified-domain.example>
 ```
 
 Replace these example values with your own configuration. `.env` is excluded from Git.
@@ -62,8 +64,8 @@ environment) and apply the migrations:
 npm run db:migrate
 ```
 
-This includes workspaces, projects, tasks, project statuses, invitations, and
-refresh sessions. Integration and HTTP tests use the separate local `oriva_test`
+This includes workspaces, projects, tasks, project statuses, invitations,
+refresh sessions, and password-reset tokens. Integration and HTTP tests use the separate local `oriva_test`
 database configured by `TEST_DATABASE_URL` in `.env.test`.
 
 ### 4. Start Redis
@@ -119,8 +121,10 @@ port 6379 for local development. Keep dollar-containing `.env` values such as
 - `POST /login` — returns a 15-minute access JWT and sets an HttpOnly refresh cookie.
 - `POST /auth/refresh` — rotates the refresh cookie and returns a new access JWT.
 - `POST /auth/logout` — revokes the cookie's login family and clears the cookie.
+- `POST /auth/forgot-password` — queues a reset request and returns a generic `202` response.
+- `POST /auth/reset-password` — accepts a reset token and new password, returning `204` on success.
 
-Login, refresh, and logout require an `Origin` header matching `APP_ORIGIN`;
+Login, refresh, logout, and both password-reset endpoints require an `Origin` header matching `APP_ORIGIN`;
 missing or untrusted origins return `403 UNTRUSTED_ORIGIN`. Configure this value
 to the frontend origin (scheme, hostname, and port) in each environment.
 Refresh/logout use the cookie and do not require a valid access JWT. Send access
@@ -151,6 +155,56 @@ Emails are trimmed, lowercased, and unique after applying migration
 Password and role changes are not supported by `PATCH /me`.
 The former `/users` and `/users/:user_id` read/update/delete routes are retired.
 `POST /users` remains available for registration.
+
+### Password reset
+
+Apply migration `0009_password-reset-tokens` to the API and worker's database.
+Run Redis and the email worker with `DATABASE_URL`, `RESEND_API_KEY`,
+`EMAIL_FROM`, and `APP_ORIGIN` configured.
+
+Send a JSON body to `POST /auth/forgot-password`.
+
+```json
+{ "email": "alex@example.com" }
+```
+
+For valid input, registered and unregistered emails receive the same `202`
+message, "If an account exists with that email, we’ll send a password-reset link."
+This acknowledges a queued request. The worker looks up the account, saves the
+token hash, and queues email delivery for registered accounts. Request-processing
+jobs have one attempt. Delivery jobs allow up to three attempts and reuse the
+same link and provider idempotency key.
+
+The email link targets `/reset-password?token=...` on the configured frontend
+origin. The frontend page submits the original token and chosen password to
+`POST /auth/reset-password`.
+
+```json
+{ "token": "<token-from-the-email-link>", "newPassword": "a-new-strong-password" }
+```
+
+Both endpoints are public. The reset token authorizes the password update.
+Tokens expire 15 minutes after creation, are stored as SHA-256 hashes in
+PostgreSQL, and can be used once. A replacement link invalidates the previous
+one. The new password must contain at least 8 characters and fit within bcrypt's
+72-byte UTF-8 limit. Invalid, expired, and used tokens return
+`400 INVALID_RESET_TOKEN`. Invalid input returns `422`.
+
+A successful reset updates the bcrypt password hash, consumes the token, and
+revokes all of that account's refresh sessions in one transaction. It clears the
+refresh cookie and returns an empty `204` response. The client should discard its
+access token and ask the user to sign in again. Already-issued access tokens
+remain valid until their normal expiry.
+
+Successful password changes and email changes also invalidate outstanding reset
+links in the same transaction. Signing in, editing only the name, or submitting
+the unchanged email preserves the link. Requesting a link preserves existing
+passwords and sessions.
+
+The worker skips delivery when a token has been used, expired, or replaced.
+An email already being sent can still arrive with an invalid link. Reset email
+jobs temporarily contain the original token in Redis and are removed on
+completion or final failure.
 
 ### Workspace project endpoints
 
@@ -324,7 +378,8 @@ unlimited guarantee against duplicate delivery.
 `src/config/env.ts` loads environment settings once and provides `requiredEnv`.
 Database access requires `DATABASE_URL`; authentication requires `SECRET_KEY`
 and `APP_ORIGIN`;
-the email worker requires `RESEND_API_KEY`; profile storage requires
+the email worker requires `DATABASE_URL`, `RESEND_API_KEY`, `EMAIL_FROM`, and
+`APP_ORIGIN`; profile storage requires
 `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_BUCKET_NAME`.
 Each component checks its settings when initialized. Missing or whitespace-only
 values produce an error naming the setting without printing its value. Existing
@@ -351,10 +406,15 @@ Email retry integration tests also require `redis-server` on PATH (or a
 with a private Unix socket, no network listener, and no persistence. The actual
 queue, worker, and email service run against it, while Resend is mocked. Tests
 check exhaustion after three attempts, exponential delays, immediate permanent
-failure, successful recovery, and stable idempotency keys. They close all clients,
+failure, successful recovery, stable idempotency keys, obsolete reset-link
+skipping, and removal of reset jobs containing secrets. They close all clients,
 stop Redis, and remove their temporary files afterward. No real emails are sent.
 
 The HTTP suite starts the app on an available loopback port and uses real password checks, JWTs, routes, controllers, and PostgreSQL. Email queuing, cloud uploads, and Redis are mocked; they are not covered by this flow. The HTTP server and database pool are closed when testing finishes.
+
+Password-reset coverage includes generic request responses, validation, origin
+checks, email/IP limits, expiry, token reuse and replacement, concurrent resets,
+rollback on revocation failure, and cancellation after password or email changes.
 
 The public `GET /error` route intentionally throws an error to exercise error handling. Remove or restrict it before deployment.
 
@@ -428,6 +488,13 @@ Login requests are limited to 10 per IP address per 15 minutes, before login
 validation and password checking. Further requests return 429 with a request ID
 and `Retry-After` header. Counts use process memory: restarting the API resets
 them, and multiple API processes do not share counts.
+
+Password-reset requests allow 10 per IP and 3 per normalized email every
+15 minutes. The IP counter runs before origin checks and validation, while the
+email counter runs after validation and counts registered and unregistered
+addresses alike. Reset submissions have a separate limit of 10 per IP every
+15 minutes, including failed attempts. These limiters also use process memory
+and return `429 RATE_LIMITED` when exceeded.
 
 Every request receives a server-generated `X-Request-ID`. The request logger
 records that ID, timestamp, method, full path without the query string, response

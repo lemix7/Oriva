@@ -2,7 +2,6 @@ import { Resend } from "resend";
 import { requiredEnv } from "../config/env.ts";
 import { UnrecoverableError } from "bullmq";
 
-
 const resend = new Resend(requiredEnv("RESEND_API_KEY"));
 
 const newUserEmail = async function (
@@ -77,6 +76,54 @@ export async function sendInvitationEmail(
         "Sign in with this email address to accept.",
         `Invitation token: ${token}`,
         "This invitation expires in seven days.",
+      ].join("\n\n"),
+    },
+    {
+      signal: AbortSignal.timeout(5000),
+      idempotencyKey,
+    },
+  );
+
+  if (error) {
+    const retryable =
+      error.statusCode === null ||
+      error.statusCode === 408 ||
+      error.name === "rate_limit_exceeded" ||
+      error.name === "concurrent_idempotent_requests" ||
+      (error.statusCode !== null && error.statusCode >= 500);
+
+    if (!retryable) {
+      throw new UnrecoverableError(error.message);
+    }
+
+    throw new Error(error.message);
+  }
+
+  if (!data) {
+    throw new Error("Email provider returned no result");
+  }
+
+  return data;
+}
+
+export async function sendPasswordResetEmail(
+  email: string,
+  token: string,
+  idempotencyKey: string,
+) {
+  const resetUrl = new URL("/reset-password", requiredEnv("APP_ORIGIN"));
+  resetUrl.searchParams.set("token", token);
+
+  const { data, error } = await resend.emails.send(
+    {
+      from: requiredEnv("EMAIL_FROM"),
+      to: email,
+      subject: "Reset your Oriva password",
+      text: [
+        "We received a request to reset your password.",
+        `Open this link to choose a new password: ${resetUrl.href}`,
+        "This link expires 15 minutes after it was requested.",
+        "If you did not request this, you can ignore this email.",
       ].join("\n\n"),
     },
     {

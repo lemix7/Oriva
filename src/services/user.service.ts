@@ -1,5 +1,8 @@
 import { updateUserProfile } from "../repositories/user.repository.ts";
 import { AppError } from "../shared/app-error.ts";
+import { db } from "../db/index.ts";
+import { lockAuthUser } from "../repositories/refresh-session.repository.ts";
+import { invalidatePasswordResetToken } from "../repositories/password-reset-repository.ts";
 
 export async function editCurrentUserProfile(
   userId: number,
@@ -8,10 +11,7 @@ export async function editCurrentUserProfile(
     email?: string;
   },
 ) {
-  if (
-    changes.name === undefined &&
-    changes.email === undefined
-  ) {
+  if (changes.name === undefined && changes.email === undefined) {
     throw new AppError(
       422,
       "EMPTY_UPDATE",
@@ -19,11 +19,23 @@ export async function editCurrentUserProfile(
     );
   }
 
-  const user = await updateUserProfile(userId, changes);
+  return db.transaction(async (tx) => {
+    const currentUser = await lockAuthUser(tx, userId);
 
-  if (!user) {
-    throw new AppError(404, "NOT_FOUND", "User not found");
-  }
+    if (!currentUser) {
+      throw new AppError(404, "NOT_FOUND", "User not found");
+    }
 
-  return user;
+    const user = await updateUserProfile(userId, changes, tx);
+
+    if (!user) {
+      throw new AppError(404, "NOT_FOUND", "User not found");
+    }
+
+    if (changes.email !== undefined && changes.email !== currentUser.email) {
+      await invalidatePasswordResetToken(tx, userId, new Date());
+    }
+
+    return user;
+  });
 }
