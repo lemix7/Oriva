@@ -9,8 +9,11 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import loginRateLimit from "../../middleware/login-rate-limit.ts";
 import { hashRefreshToken } from "../../shared/refresh-token.ts";
+import { generatePasswordResetToken } from "../../shared/password-reset-token.ts";
+import { forgotPasswordIpLimit, resetPasswordLimit } from "../../middleware/password-reset-rate-limit.ts";
 
-jest.unstable_mockModule("../../queue/email.que.js", () => ({ default: { add: jest.fn() } }));
+const addEmailJob = jest.fn<(...args: unknown[]) => Promise<unknown>>();
+jest.unstable_mockModule("../../queue/email.que.js", () => ({ default: { add: addEmailJob } }));
 jest.unstable_mockModule("../../adapters/profile-pic-storage.adapter.js", () => ({ uploadProfilePicture: jest.fn(), deleteProfilePicture: jest.fn() }));
 const requestLog = jest.spyOn(console, "log").mockImplementation(() => {});
 const errorLog = jest.spyOn(console, "error").mockImplementation(() => {});
@@ -46,6 +49,9 @@ beforeAll(async () => {
 beforeEach(async () => {
   userIds = []; emails = []; requestLog.mockClear(); errorLog.mockClear();
   loginRateLimit.resetKey("127.0.0.1");
+  forgotPasswordIpLimit.resetKey("127.0.0.1");
+  resetPasswordLimit.resetKey("127.0.0.1");
+  addEmailJob.mockReset().mockResolvedValue({});
   for (const name of ["HTTP session owner", "Other HTTP session owner"]) {
     const email = `${randomUUID().replace(/-/g, "").slice(0, 16)}@test.local`;
     emails.push(email);
@@ -358,4 +364,185 @@ test("five wrong password attempts leave credentials intact and rate-limit only 
   expect(await sessions()).toEqual(before);
   await login();
   expect((await changePassword({ token: otherUser.token })).status).toBe(204);
+});
+
+async function saveResetToken() {
+  const generated = generatePasswordResetToken();
+  await pool!.query(
+    "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1,$2,now() + interval '15 minutes') ON CONFLICT (user_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, expires_at = EXCLUDED.expires_at, used_at = NULL",
+    [userIds[0], generated.tokenHash],
+  );
+  return generated.token;
+}
+
+function submitReset(token: string, replacement = "replacement-http-password") {
+  return request("/auth/reset-password", { body: { token, newPassword: replacement } });
+}
+
+test("forgot-password queues known and unknown emails with the same public response", async () => {
+  const bodies: unknown[] = [];
+  for (const email of [emails[0], "unknown@test.local"]) {
+    const response = await request("/auth/forgot-password", { body: { email } });
+    expect(response.status).toBe(202);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("set-cookie")).toBeNull();
+    bodies.push(await response.json());
+  }
+  expect(bodies[0]).toEqual(bodies[1]);
+  expect(addEmailJob.mock.calls.map(call => call.slice(0, 2))).toEqual([
+    ["requestPasswordReset", { email: emails[0] }],
+    ["requestPasswordReset", { email: "unknown@test.local" }],
+  ]);
+  expect((await pool!.query("SELECT * FROM password_reset_tokens WHERE user_id = $1", [userIds[0]])).rows).toEqual([]);
+});
+
+test("the queued request creates a link that resets credentials without an access token", async () => {
+  const first = await login();
+  const second = await login();
+  const other = await login(emails[1]);
+  const accepted = await request("/auth/forgot-password", { body: { email: emails[0] } });
+  expect(accepted.status).toBe(202);
+  await accepted.json();
+  const { requestPasswordReset } = await import("../../services/password-reset.service.ts");
+  await requestPasswordReset((addEmailJob.mock.calls[0][1] as { email: string }).email);
+  const delivery = addEmailJob.mock.calls.find(call => call[0] === "sendPasswordResetEmail")!;
+  expect(delivery).toBeDefined();
+  const token = (delivery[1] as { token: string }).token;
+  const response = await submitReset(token);
+  expect(response.status).toBe(204);
+  expect(await response.text()).toBe("");
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("set-cookie")).toMatch(/^oriva_refresh=;/);
+  expect(response.headers.get("set-cookie")).not.toContain(token);
+
+  for (const cookie of [first.cookie, second.cookie]) {
+    const denied = await request("/auth/refresh", { cookie });
+    expect(denied.status).toBe(401);
+    await denied.json();
+  }
+  const unaffected = await request("/auth/refresh", { cookie: other.cookie });
+  expect(unaffected.status).toBe(200);
+  await unaffected.json();
+  const oldLogin = await request("/login", { body: { email: emails[0], password } });
+  expect(oldLogin.status).toBe(401);
+  await oldLogin.text();
+  const newLogin = await request("/login", { body: { email: emails[0], password: "replacement-http-password" } });
+  expect(newLogin.status).toBe(200);
+  await newLogin.json();
+  const reused = await submitReset(token);
+  expect(reused.status).toBe(400);
+  expect((await reused.json()).error.code).toBe("INVALID_RESET_TOKEN");
+  const logs = JSON.stringify([requestLog.mock.calls, errorLog.mock.calls]);
+  expect(logs).not.toContain(token);
+  expect(logs).not.toContain("replacement-http-password");
+});
+
+test("email normalization shares one three-request limit for registered and unregistered addresses", async () => {
+  for (const email of [emails[0], "missing@test.local"]) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await request("/auth/forgot-password", { body: {
+        email: attempt === 1 ? `  ${email.toUpperCase()}  ` : email,
+      } });
+      expect(response.status).toBe(202);
+      await response.json();
+    }
+    const denied = await request("/auth/forgot-password", { body: { email } });
+    expect(denied.status).toBe(429);
+    expect((await denied.json()).error.code).toBe("RATE_LIMITED");
+    expect(denied.headers.get("retry-after")).toBeTruthy();
+  }
+  expect(addEmailJob).toHaveBeenCalledTimes(6);
+});
+
+test("the IP limit stops reset requests spread across different email addresses", async () => {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const response = await request("/auth/forgot-password", { body: { email: `ip-limit-${attempt}@test.local` } });
+    expect(response.status).toBe(202);
+    await response.json();
+  }
+  const denied = await request("/auth/forgot-password", { body: { email: emails[0] } });
+  expect(denied.status).toBe(429);
+  await denied.json();
+  expect(addEmailJob).toHaveBeenCalledTimes(10);
+});
+
+test.each([{}, { email: 123 }, { email: "invalid" }])("forgot-password rejects invalid input before queueing: %j", async body => {
+  const response = await request("/auth/forgot-password", { body });
+  expect(response.status).toBe(422);
+  await response.json();
+  expect(addEmailJob).not.toHaveBeenCalled();
+});
+
+test.each(["/auth/forgot-password", "/auth/reset-password"])("untrusted origins cannot use %s", async path => {
+  for (const requestOrigin of [null, "https://evil.test"]) {
+    const response = await request(path, { origin: requestOrigin, body: {} });
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("UNTRUSTED_ORIGIN");
+    expect(response.headers.get("set-cookie")).toBeNull();
+  }
+  expect(addEmailJob).not.toHaveBeenCalled();
+});
+
+test.each([
+  {},
+  { token: "a".repeat(43) },
+  { token: 123, newPassword: "replacement-password" },
+  { token: "invalid-token", newPassword: "replacement-password" },
+  { token: "a".repeat(43), newPassword: "short" },
+  { token: "a".repeat(43), newPassword: "a".repeat(73) },
+])("reset rejects invalid input without clearing cookies: %j", async body => {
+  const response = await request("/auth/reset-password", { body });
+  expect(response.status).toBe(422);
+  await response.json();
+  expect(response.headers.get("set-cookie")).toBeNull();
+});
+
+test.each(["unknown", "expired", "used"])("a %s link returns the same invalid-token error", async state => {
+  const token = await saveResetToken();
+  if (state === "expired") {
+    await pool!.query("UPDATE password_reset_tokens SET expires_at = now() - interval '1 second' WHERE user_id = $1", [userIds[0]]);
+  }
+  if (state === "used") {
+    await pool!.query("UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1", [userIds[0]]);
+  }
+  const response = await submitReset(state === "unknown" ? "a".repeat(43) : token);
+  expect(response.status).toBe(400);
+  expect((await response.json()).error.code).toBe("INVALID_RESET_TOKEN");
+  expect(response.headers.get("set-cookie")).toBeNull();
+  await login();
+});
+
+test("reset failures count toward the separate submission limit", async () => {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const response = await submitReset("a".repeat(43));
+    expect(response.status).toBe(400);
+    await response.json();
+  }
+  const validToken = await saveResetToken();
+  const denied = await submitReset(validToken);
+  expect(denied.status).toBe(429);
+  await denied.json();
+  expect(denied.headers.get("set-cookie")).toBeNull();
+  const forgot = await request("/auth/forgot-password", { body: { email: emails[0] } });
+  expect(forgot.status).toBe(202);
+  await forgot.json();
+});
+
+test("reset enforces the bcrypt byte limit and accepts its exact UTF-8 boundary", async () => {
+  const token = await saveResetToken();
+  const rejected = await submitReset(token, "é".repeat(37));
+  expect(rejected.status).toBe(422);
+  expect((await rejected.json()).error.code).toBe("PASSWORD_TOO_LONG");
+  const accepted = await submitReset(token, "é".repeat(36));
+  expect(accepted.status).toBe(204);
+});
+
+test("a queue outage returns a generic server error without exposing the email or credentials", async () => {
+  addEmailJob.mockRejectedValue(new Error("Private queue failure"));
+  const response = await request("/auth/forgot-password", { body: { email: emails[0] } });
+  expect(response.status).toBe(500);
+  const body = await response.json();
+  expect(body).toMatchObject({ message: "Internal server error" });
+  expect(JSON.stringify(body)).not.toContain(emails[0]);
+  expect(JSON.stringify(body)).not.toContain("Private queue failure");
 });

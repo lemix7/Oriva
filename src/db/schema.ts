@@ -237,3 +237,15 @@ export const refreshSessions = pgTable(
     index("refresh_sessions_user_family_idx").on(table.userId, table.familyId),
   ],
 );
+
+export const passwordResetTokens = pgTable("password_reset_tokens", {
+  userId: integer("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  tokenHash: varchar("token_hash", { length: 64 }).notNull().unique(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});

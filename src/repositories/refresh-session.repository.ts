@@ -6,7 +6,7 @@ type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
 export async function lockAuthUser(tx: Transaction, userId: number) {
   const [user] = await tx
-    .select({ id: users.id, password: users.password })
+    .select({ id: users.id, password: users.password, email: users.email })
     .from(users)
     .where(eq(users.id, userId))
     .limit(1)

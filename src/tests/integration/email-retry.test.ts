@@ -9,6 +9,11 @@ import type { Queue, QueueEvents, Worker } from "bullmq";
 const send = jest.fn<(...args: unknown[]) => Promise<unknown>>();
 const originalApiKey = process.env.RESEND_API_KEY;
 const originalEmailFrom = process.env.EMAIL_FROM;
+const originalOrigin = process.env.APP_ORIGIN;
+const findPasswordResetTokenByHash = jest.fn<(...args: unknown[]) => Promise<unknown>>();
+const requestPasswordReset = jest.fn<(email: string) => Promise<void>>();
+jest.unstable_mockModule("../../repositories/password-reset-repository.js", () => ({ findPasswordResetTokenByHash }));
+jest.unstable_mockModule("../../services/password-reset.service.js", () => ({ requestPasswordReset }));
 let directory: string | undefined;
 let redisProcess: ChildProcess | undefined;
 let queue: Queue | undefined;
@@ -25,6 +30,7 @@ jest.unstable_mockModule("dotenv", () => ({ default: { config: jest.fn() } }));
 beforeAll(async () => {
   process.env.RESEND_API_KEY = "integration-test-resend-key";
   process.env.EMAIL_FROM = "Oriva <invite@test.local>";
+  process.env.APP_ORIGIN = "https://oriva.test";
   // A fresh socket-only Redis process ensures tests cannot reach application
   // queues or send real email. It never listens on a network port or saves data.
   directory = await mkdtemp(join(tmpdir(), "oriva-email-"));
@@ -64,7 +70,13 @@ beforeAll(async () => {
   await Promise.all([queue.waitUntilReady(), worker.waitUntilReady()]);
 });
 
-beforeEach(() => { send.mockReset(); });
+beforeEach(() => {
+  send.mockReset();
+  requestPasswordReset.mockReset().mockResolvedValue(undefined);
+  findPasswordResetTokenByHash.mockReset().mockResolvedValue({
+    userId: 42, usedAt: null, expiresAt: new Date(Date.now() + 60000),
+  });
+});
 
 afterAll(async () => {
   try {
@@ -74,6 +86,8 @@ afterAll(async () => {
     else process.env.RESEND_API_KEY = originalApiKey;
     if (originalEmailFrom === undefined) delete process.env.EMAIL_FROM;
     else process.env.EMAIL_FROM = originalEmailFrom;
+    if (originalOrigin === undefined) delete process.env.APP_ORIGIN;
+    else process.env.APP_ORIGIN = originalOrigin;
     logs?.mockRestore();
     errors?.mockRestore();
     if (redisProcess && redisProcess.exitCode === null && redisProcess.signalCode === null) {
@@ -176,4 +190,70 @@ test("a recovered job completes on the next attempt and reuses the original requ
   expect(send).toHaveBeenCalledTimes(2);
   expect(new Set(keysUsed()).size).toBe(1);
   expect(send.mock.calls[0]![0]).toEqual(send.mock.calls[1]![0]);
+});
+
+test("request jobs call the reset service in the background and remove their data", async () => {
+  const job = await queue!.add("requestPasswordReset", { email: "sara@test.local" }, {
+    attempts: 1, removeOnComplete: true, removeOnFail: true,
+  });
+  await job.waitUntilFinished(events!, 10000);
+  expect(requestPasswordReset).toHaveBeenCalledWith("sara@test.local");
+  expect(send).not.toHaveBeenCalled();
+  expect(await queue!.getJob(job.id!)).toBeUndefined();
+});
+
+test("reset delivery retries the same link with one key and removes completed secrets", async () => {
+  send.mockResolvedValueOnce(temporaryFailure)
+    .mockResolvedValue({ data: { id: "reset-delivered" }, error: null });
+  const job = await queue!.add("sendPasswordResetEmail", {
+    email: "sara@test.local", token: "reset-worker-test-token",
+  }, { removeOnComplete: true, removeOnFail: true });
+  await job.waitUntilFinished(events!, 10000);
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(findPasswordResetTokenByHash).toHaveBeenCalledTimes(2);
+  expect(keysUsed()).toEqual(Array(2).fill(
+    `sendPasswordResetEmail/emailQueue/${job.id}/${job.timestamp}`,
+  ));
+  expect(send.mock.calls[0][0]).toEqual(send.mock.calls[1][0]);
+  expect(await queue!.getJob(job.id!)).toBeUndefined();
+  expect(JSON.stringify(logs!.mock.calls)).not.toContain("reset-worker-test-token");
+});
+
+test.each(["replaced", "used", "expired"])("the worker skips a %s reset link", async state => {
+  findPasswordResetTokenByHash.mockResolvedValue(state === "replaced" ? null : {
+    userId: 42,
+    usedAt: state === "used" ? new Date() : null,
+    expiresAt: state === "expired" ? new Date(0) : new Date(Date.now() + 60000),
+  });
+  const job = await queue!.add("sendPasswordResetEmail", {
+    email: "sara@test.local", token: "obsolete-worker-token",
+  }, { removeOnComplete: true });
+  await job.waitUntilFinished(events!, 10000);
+  expect(send).not.toHaveBeenCalled();
+  expect(await queue!.getJob(job.id!)).toBeUndefined();
+});
+
+test("a link replaced during delivery backoff is skipped on the next attempt", async () => {
+  send.mockResolvedValue(temporaryFailure);
+  findPasswordResetTokenByHash
+    .mockResolvedValueOnce({ userId: 42, usedAt: null, expiresAt: new Date(Date.now() + 60000) })
+    .mockResolvedValue(null);
+  const job = await queue!.add("sendPasswordResetEmail", {
+    email: "sara@test.local", token: "replaced-during-retry",
+  }, { removeOnComplete: true, removeOnFail: true });
+  await job.waitUntilFinished(events!, 10000);
+  expect(findPasswordResetTokenByHash).toHaveBeenCalledTimes(2);
+  expect(send).toHaveBeenCalledTimes(1);
+});
+
+test("permanently failed reset delivery removes its queued token", async () => {
+  send.mockResolvedValue({ data: null, error: {
+    name: "validation_error", statusCode: 422, message: "Invalid recipient",
+  } });
+  const job = await queue!.add("sendPasswordResetEmail", {
+    email: "sara@test.local", token: "failed-delivery-token",
+  }, { removeOnComplete: true, removeOnFail: true });
+  await expect(job.waitUntilFinished(events!, 10000)).rejects.toThrow("Invalid recipient");
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(await queue!.getJob(job.id!)).toBeUndefined();
 });

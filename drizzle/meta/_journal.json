@@ -64,6 +64,13 @@
       "when": 1793697383847,
       "tag": "0008_refresh-sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794468279636,
+      "tag": "0009_password-reset-tokens",
+      "breakpoints": true
     }
   ]
 }

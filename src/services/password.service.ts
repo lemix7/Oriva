@@ -6,6 +6,7 @@ import {
 } from "../repositories/refresh-session.repository.ts";
 import { updateUserPassword } from "../repositories/user.repository.ts";
 import { AppError } from "../shared/app-error.ts";
+import { invalidatePasswordResetToken } from "../repositories/password-reset-repository.ts";
 
 export async function changeCurrentUserPassword(
   userId: number,
@@ -45,6 +46,9 @@ export async function changeCurrentUserPassword(
       throw new Error("Password update returned no row");
     }
 
-    await revokeAllRefreshSessions(tx, userId, new Date());
+    const now = new Date();
+
+    await invalidatePasswordResetToken(tx, userId, now);
+    await revokeAllRefreshSessions(tx, userId, now);
   });
 }
